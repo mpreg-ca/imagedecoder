@@ -1,0 +1,13 @@
+diff --git a/meson.build b/meson.build
+index af82dabc2..4c8eba028 100644
+--- a/meson.build
++++ b/meson.build
+@@ -776,8 +776,3 @@ if get_option('cplusplus')
+ endif
+
+ # these lines removed by a regexp for oss-fuzz builds, don't touch!
+-subdir('man')
+-subdir('po')
+-subdir('tools')
+-subdir('test')
+-subdir('fuzz')
