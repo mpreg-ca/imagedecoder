@@ -4,8 +4,9 @@ import java.io.InputStream
 import java.nio.ByteBuffer
 
 class ImageDecoder private constructor(
-    private val nativePtr: Long,
+    private val ptr: Long,
     val count: Int,
+    var page: Int,
     val isHdr: Boolean,
 ) {
     class DecodeException private constructor(message: String) : Exception(message)
@@ -16,28 +17,39 @@ class ImageDecoder private constructor(
         val width: Int,
         val height: Int,
         val duration: Int,
-        val page: Int,
+        val trim_left: Int,
+        val trim_top: Int,
+        val trim_width: Int,
+        val trim_height: Int,
     ) {
         protected fun finalize() {
-            free(ptr)
+            free()
         }
 
-        private external fun free(ptr: Long)
+        private external fun free()
+    }
+
+    protected fun finalize() {
+        free()
     }
 
     @Synchronized
     @Throws(DecodeException::class)
-    fun decodeNext(crop: Boolean = false): DecodeResult? {
-        return decodeNext(nativePtr, crop)
+    fun decodeNext(crop: Boolean = false, getTrim: Boolean = false): DecodeResult {
+        val res = decode(page, crop, getTrim)
+        page = (page + 1) % count
+        return res
     }
 
-    protected fun finalize() {
-        free(nativePtr)
-    }
+    @Synchronized
+    @Throws(DecodeException::class)
+    external fun decode(
+        page: Int = 0,
+        crop: Boolean = false,
+        getTrim: Boolean = false
+    ): DecodeResult
 
-    private external fun decodeNext(nativePtr: Long, crop: Boolean): DecodeResult?
-
-    private external fun free(nativePtr: Long)
+    private external fun free()
 
     companion object {
         init {
@@ -46,6 +58,6 @@ class ImageDecoder private constructor(
 
         @JvmStatic
         @Throws(DecodeException::class)
-        external fun newInstance(inputStream: InputStream): ImageDecoder?
+        external fun new(inputStream: InputStream): ImageDecoder
     }
 }

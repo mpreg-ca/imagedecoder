@@ -1,0 +1,4 @@
+BasedOnStyle: Mozilla
+ColumnLimit: 100
+BinPackArguments: true
+BinPackParameters: true

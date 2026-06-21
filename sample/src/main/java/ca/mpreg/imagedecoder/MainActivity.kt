@@ -28,8 +28,8 @@ class MainActivity : ComponentActivity() {
 
         CoroutineScope(Dispatchers.Default).launch {
             val stream = assets.open("anim-icos.gif")
-            val decoder = ImageDecoder.newInstance(stream)
-            decoder?.decodeNext()
+            val decoder = ImageDecoder.new(stream)
+            decoder.decode()
         }
 
         enableEdgeToEdge()
