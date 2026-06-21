@@ -5,7 +5,7 @@ import java.nio.ByteBuffer
 
 class ImageDecoder private constructor(
     private val ptr: Long,
-    val count: Int,
+    val pages: Int,
     var page: Int,
     val isHdr: Boolean,
 ) {
@@ -33,7 +33,7 @@ class ImageDecoder private constructor(
     @Throws(DecodeException::class)
     fun decodeNext(crop: Boolean = false, getTrim: Boolean = false): DecodeResult {
         val res = decode(page, crop, getTrim)
-        page = (page + 1) % count
+        page = (page + 1) % pages
         return res
     }
 

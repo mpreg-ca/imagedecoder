@@ -54,7 +54,7 @@ read_all(JNIEnv* env, jobject jstream)
 struct Decoder
 {
   std::vector<uint8_t> buffer;
-  int count;
+  int pages;
   std::vector<int> durations;
 };
 
@@ -73,9 +73,9 @@ Java_ca_mpreg_imagedecoder_ImageDecoder_new(JNIEnv* env, jclass, jobject jstream
     env->ThrowNew(env->FindClass("ca/mpreg/imagedecoder/ImageDecoder$DecodeException"), e.what());
   }
 
-  decoder->count = image.get_typeof(VIPS_META_N_PAGES) != 0 ? image.get_int(VIPS_META_N_PAGES) : 1;
+  decoder->pages = image.get_typeof(VIPS_META_N_PAGES) != 0 ? image.get_int(VIPS_META_N_PAGES) : 1;
 
-  if (decoder->count > 0 && image.get_typeof("delay") != 0) {
+  if (decoder->pages > 0 && image.get_typeof("delay") != 0) {
     int* delays;
     int n;
 
@@ -89,7 +89,7 @@ Java_ca_mpreg_imagedecoder_ImageDecoder_new(JNIEnv* env, jclass, jobject jstream
 
   jclass cls = env->FindClass("ca/mpreg/imagedecoder/ImageDecoder");
   jmethodID ctor = env->GetMethodID(cls, "<init>", "(JIIZ)V");
-  return env->NewObject(cls, ctor, reinterpret_cast<jlong>(decoder), decoder->count, 0, is_hdr);
+  return env->NewObject(cls, ctor, reinterpret_cast<jlong>(decoder), decoder->pages, 0, is_hdr);
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -130,7 +130,7 @@ Java_ca_mpreg_imagedecoder_ImageDecoder_decode(JNIEnv* env, jobject obj, jint pa
     int height = frame.height();
 
     int duration = 0;
-    if (decoder->count > 0 && page < decoder->durations.size()) {
+    if (decoder->pages > 0 && page < decoder->durations.size()) {
       duration = decoder->durations[page];
     }
 
