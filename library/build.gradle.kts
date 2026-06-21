@@ -3,13 +3,13 @@ plugins {
     id("com.vanniktech.maven.publish") version "0.36.0"
 }
 
-// val gitCommitId = providers.exec {
-//     commandLine("git", "rev-parse", "--short", "HEAD")
-// }.standardOutput.asText.map { it.trim() }.getOrElse("unknown")
+val gitCommitId = providers.exec {
+    commandLine("git", "rev-parse", "--short", "HEAD")
+}.standardOutput.asText.map { it.trim() }.getOrElse("unknown")
 
-// val baseVersion = "1-$gitCommitId"
+val baseVersion = "1-$gitCommitId"
 
-// val isTag = System.getenv("GITHUB_REF_TYPE") == "tag"
+val isTag = System.getenv("GITHUB_REF_TYPE") == "tag"
 
 android {
     namespace = "ca.mpreg.imagedecoder"
@@ -17,8 +17,6 @@ android {
 
     defaultConfig {
         minSdk = 24
-
-        ndk { abiFilters += listOf("arm64-v8a") }
 
         externalNativeBuild {
             cmake {
@@ -48,4 +46,40 @@ android {
 }
 
 dependencies {
+}
+
+afterEvaluate {
+    mavenPublishing {
+        val version = if (isTag) baseVersion else "$baseVersion-SNAPSHOT"
+        coordinates("ca.mpreg", "imagedecoder", version)
+
+        pom {
+            name.set("imagedecoder")
+            description.set("imagedecoder")
+            inceptionYear.set("2026")
+            url.set("https://github.com/mpreg-ca/imagedecoder")
+            licenses {
+                license {
+                    name.set("MIT License")
+                    url.set("https://opensource.org")
+                    distribution.set("repo")
+                }
+            }
+            developers {
+                developer {
+                    id.set("wwww-wwww")
+                    name.set("w")
+                    url.set("https://github.com/wwww-wwww/")
+                }
+            }
+            scm {
+                url.set("https://github.com/mpreg-ca/imagedecoder/")
+                connection.set("scm:git:git://github.com/mpreg-ca/imagedecoder.git")
+                developerConnection.set("scm:git:ssh://git@github.com/mpreg-ca/imagedecoder.git")
+            }
+        }
+
+        publishToMavenCentral(automaticRelease = true)
+        signAllPublications()
+    }
 }
