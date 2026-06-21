@@ -66,9 +66,7 @@ Java_ca_mpreg_imagedecoder_ImageDecoder_new(JNIEnv* env, jclass, jobject jstream
 
   vips::VImage image;
   try {
-    image =
-      vips::VImage::new_from_buffer(decoder->buffer.data(), decoder->buffer.size(), "",
-                                    vips::VImage::option()->set("access", VIPS_ACCESS_SEQUENTIAL));
+    image = vips::VImage::new_from_buffer(decoder->buffer.data(), decoder->buffer.size(), "");
   } catch (const vips::VError& e) {
     delete decoder;
 
@@ -92,6 +90,14 @@ Java_ca_mpreg_imagedecoder_ImageDecoder_new(JNIEnv* env, jclass, jobject jstream
   jclass cls = env->FindClass("ca/mpreg/imagedecoder/ImageDecoder");
   jmethodID ctor = env->GetMethodID(cls, "<init>", "(JIIZ)V");
   return env->NewObject(cls, ctor, reinterpret_cast<jlong>(decoder), decoder->count, 0, is_hdr);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_ca_mpreg_imagedecoder_ImageDecoder_free(JNIEnv* env, jobject obj)
+{
+  jlong ptr = get_ptr(env, obj);
+  auto* decoder = reinterpret_cast<Decoder*>(ptr);
+  delete decoder;
 }
 
 extern "C" JNIEXPORT jobject JNICALL
@@ -159,15 +165,43 @@ Java_ca_mpreg_imagedecoder_ImageDecoder_decode(JNIEnv* env, jobject obj, jint pa
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_ca_mpreg_imagedecoder_ImageDecoder_free(JNIEnv* env, jobject obj)
+Java_ca_mpreg_imagedecoder_ImageDecoder_00024DecodeResult_free(JNIEnv* env, jobject obj)
+{
+  jlong ptr = get_ptr(env, obj);
+  g_free((void*)(intptr_t)ptr);
+}
+
+extern "C" JNIEXPORT jobject JNICALL
+Java_ca_mpreg_imagedecoder_ImageDecoder_encode(JNIEnv* env, jobject obj, jstring jsuffix, jint page)
 {
   jlong ptr = get_ptr(env, obj);
   auto* decoder = reinterpret_cast<Decoder*>(ptr);
-  delete decoder;
+
+  try {
+    vips::VImage frame =
+      vips::VImage::new_from_buffer(decoder->buffer.data(), decoder->buffer.size(), "",
+                                    vips::VImage::option()->set("page", page));
+
+    const char* suffix = env->GetStringUTFChars(jsuffix, NULL);
+
+    size_t size;
+    void* data;
+    frame.write_to_buffer(suffix, &data, &size);
+
+    env->ReleaseStringUTFChars(jsuffix, suffix);
+
+    jobject byteBuffer = env->NewDirectByteBuffer(data, size);
+
+    jclass cls = env->FindClass("ca/mpreg/imagedecoder/ImageDecoder$EncodeResult");
+    jmethodID ctor = env->GetMethodID(cls, "<init>", "(JLjava/nio/ByteBuffer;)V");
+    return env->NewObject(cls, ctor, data, byteBuffer);
+  } catch (const vips::VError& e) {
+    env->ThrowNew(env->FindClass("ca/mpreg/imagedecoder/ImageDecoder$DecodeException"), e.what());
+  }
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_ca_mpreg_imagedecoder_ImageDecoder_00024DecodeResult_free(JNIEnv* env, jobject obj)
+Java_ca_mpreg_imagedecoder_ImageDecoder_00024EncodeResult_free(JNIEnv* env, jobject obj)
 {
   jlong ptr = get_ptr(env, obj);
   g_free((void*)(intptr_t)ptr);

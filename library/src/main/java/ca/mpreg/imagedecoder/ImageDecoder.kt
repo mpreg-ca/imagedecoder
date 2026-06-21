@@ -29,10 +29,6 @@ class ImageDecoder private constructor(
         private external fun free()
     }
 
-    protected fun finalize() {
-        free()
-    }
-
     @Synchronized
     @Throws(DecodeException::class)
     fun decodeNext(crop: Boolean = false, getTrim: Boolean = false): DecodeResult {
@@ -48,6 +44,25 @@ class ImageDecoder private constructor(
         crop: Boolean = false,
         getTrim: Boolean = false
     ): DecodeResult
+
+    class EncodeResult private constructor(
+        private val ptr: Long,
+        val bytes: ByteBuffer,
+    ) {
+        protected fun finalize() {
+            free()
+        }
+
+        private external fun free()
+    }
+
+    @Synchronized
+    @Throws(DecodeException::class)
+    external fun encode(suffix: String, page: Int = -1): EncodeResult
+
+    protected fun finalize() {
+        free()
+    }
 
     private external fun free()
 
