@@ -18,8 +18,6 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
-    environment: deploy
-
     permissions:
       contents: read
       packages: write
@@ -48,12 +46,13 @@ jobs:
           sudo apt install \
             build-essential \
             ninja-build \
-            nasm
+            nasm \
+            libltdl-dev \
+            libglib2.0-dev \
+            texinfo \
+            gperf
           python -m pip install --upgrade pip
           python -m pip install meson
-
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
 
       - name: Publish Artifact
         run: ./gradlew publishToMavenCentral

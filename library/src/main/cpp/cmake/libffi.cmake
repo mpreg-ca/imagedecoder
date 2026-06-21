@@ -2,7 +2,7 @@ include(ExternalProject)
 
 ExternalProject_Add(ep_libffi
     GIT_REPOSITORY https://github.com/libffi/libffi
-    GIT_TAG v3.5.2
+    GIT_TAG v3.6.0
     BUILD_IN_SOURCE true
     CONFIGURE_COMMAND
         <SOURCE_DIR>/autogen.sh &&

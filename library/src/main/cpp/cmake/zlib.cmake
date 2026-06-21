@@ -7,5 +7,4 @@ ExternalProject_Add(ep_zlib
         ${EP_CMAKE_ARGS}
         -DINSTALL_PKGCONFIG_DIR=${THIRD_PARTY_LIB_PATH}/lib/pkgconfig
         -DZLIB_COMPAT=ON
-        -DZLIB_ENABLE_TESTS=OFF
 )

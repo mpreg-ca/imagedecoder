@@ -17,8 +17,8 @@ pkg_search_module(VIPS REQUIRED vips-cpp)
 
 list(REMOVE_ITEM VIPS_STATIC_LIBRARIES "c++")
 list(REMOVE_ITEM VIPS_STATIC_LIBRARIES "pthread")
-list(REMOVE_ITEM VIPS_STATIC_LIBRARIES "spng")
-list(APPEND VIPS_STATIC_LIBRARIES "spng_static")
+# list(REMOVE_ITEM VIPS_STATIC_LIBRARIES "spng")
+# list(APPEND VIPS_STATIC_LIBRARIES "spng_static")
 
 target_include_directories(imagedecoder PRIVATE ${VIPS_STATIC_INCLUDE_DIRS})
 target_link_directories(imagedecoder PRIVATE ${VIPS_STATIC_LIBRARY_DIRS})

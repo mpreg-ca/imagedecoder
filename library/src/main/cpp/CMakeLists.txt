@@ -132,6 +132,7 @@ include("cmake/lcms2.cmake")
 include("cmake/libwebp.cmake")
 include("cmake/libjpeg-turbo.cmake")
 include("cmake/libopenjp2.cmake")
+include("cmake/libpng.cmake")
 include("cmake/libspng.cmake")
 include("cmake/libtiff.cmake")
 
