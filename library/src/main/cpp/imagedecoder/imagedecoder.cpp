@@ -67,29 +67,30 @@ Java_ca_mpreg_imagedecoder_ImageDecoder_new(JNIEnv* env, jclass, jobject jstream
   vips::VImage image;
   try {
     image = vips::VImage::new_from_buffer(decoder->buffer.data(), decoder->buffer.size(), "");
+    decoder->pages =
+      image.get_typeof(VIPS_META_N_PAGES) != 0 ? image.get_int(VIPS_META_N_PAGES) : 1;
+
+    if (decoder->pages > 0 && image.get_typeof("delay") != 0) {
+      int* delays;
+      int n;
+
+      image.get_array_int("delay", &delays, &n);
+
+      decoder->durations.resize(n);
+      memcpy(decoder->durations.data(), delays, n * 4);
+    }
+
+    auto is_hdr = image.interpretation() == VIPS_INTERPRETATION_scRGB;
+
+    jclass cls = env->FindClass("ca/mpreg/imagedecoder/ImageDecoder");
+    jmethodID ctor = env->GetMethodID(cls, "<init>", "(JIIZ)V");
+    return env->NewObject(cls, ctor, reinterpret_cast<jlong>(decoder), decoder->pages, 0, is_hdr);
   } catch (const vips::VError& e) {
     delete decoder;
 
     env->ThrowNew(env->FindClass("ca/mpreg/imagedecoder/ImageDecoder$DecodeException"), e.what());
+    return nullptr;
   }
-
-  decoder->pages = image.get_typeof(VIPS_META_N_PAGES) != 0 ? image.get_int(VIPS_META_N_PAGES) : 1;
-
-  if (decoder->pages > 0 && image.get_typeof("delay") != 0) {
-    int* delays;
-    int n;
-
-    image.get_array_int("delay", &delays, &n);
-
-    decoder->durations.resize(n);
-    memcpy(decoder->durations.data(), delays, n * 4);
-  }
-
-  auto is_hdr = image.interpretation() == VIPS_INTERPRETATION_scRGB;
-
-  jclass cls = env->FindClass("ca/mpreg/imagedecoder/ImageDecoder");
-  jmethodID ctor = env->GetMethodID(cls, "<init>", "(JIIZ)V");
-  return env->NewObject(cls, ctor, reinterpret_cast<jlong>(decoder), decoder->pages, 0, is_hdr);
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -111,7 +112,7 @@ Java_ca_mpreg_imagedecoder_ImageDecoder_decode(JNIEnv* env, jobject obj, jint pa
     vips::VImage frame = vips::VImage::new_from_buffer(
       decoder->buffer.data(), decoder->buffer.size(), "",
       vips::VImage::option()
-        ->set("access", crop ? VIPS_ACCESS_RANDOM : VIPS_ACCESS_SEQUENTIAL)
+        ->set("access", (crop || getTrim) ? VIPS_ACCESS_RANDOM : VIPS_ACCESS_SEQUENTIAL)
         ->set("page", page));
 
     if (frame.interpretation() != VIPS_INTERPRETATION_sRGB &&
@@ -134,7 +135,10 @@ Java_ca_mpreg_imagedecoder_ImageDecoder_decode(JNIEnv* env, jobject obj, jint pa
       duration = decoder->durations[page];
     }
 
-    int trim_left, trim_top, trim_width, trim_height;
+    int trim_left = 0;
+    int trim_top = 0;
+    int trim_width = 0;
+    int trim_height = 0;
 
     if (crop || getTrim) {
       trim_left = frame.find_trim(&trim_top, &trim_width, &trim_height);
@@ -161,6 +165,7 @@ Java_ca_mpreg_imagedecoder_ImageDecoder_decode(JNIEnv* env, jobject obj, jint pa
                           trim_width, trim_height);
   } catch (const vips::VError& e) {
     env->ThrowNew(env->FindClass("ca/mpreg/imagedecoder/ImageDecoder$DecodeException"), e.what());
+    return nullptr;
   }
 }
 
@@ -197,6 +202,7 @@ Java_ca_mpreg_imagedecoder_ImageDecoder_encode(JNIEnv* env, jobject obj, jstring
     return env->NewObject(cls, ctor, data, byteBuffer);
   } catch (const vips::VError& e) {
     env->ThrowNew(env->FindClass("ca/mpreg/imagedecoder/ImageDecoder$DecodeException"), e.what());
+    return nullptr;
   }
 }
 

@@ -10,4 +10,5 @@ ExternalProject_Add(ep_libpng
         -DPNG_SHARED=OFF
         -DPNG_TESTS=OFF
         -DPNG_TOOLS=OFF
+        "-DCMAKE_BUILD_TYPE=Release"
 )
