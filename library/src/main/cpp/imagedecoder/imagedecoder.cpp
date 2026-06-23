@@ -141,7 +141,21 @@ Java_ca_mpreg_imagedecoder_ImageDecoder_decode(JNIEnv* env, jobject obj, jint pa
     int trim_height = 0;
 
     if (crop || getTrim) {
-      trim_left = frame.find_trim(&trim_top, &trim_width, &trim_height);
+      int trim_left_w, trim_top_w, trim_width_w, trim_height_w;
+      trim_left_w = frame.find_trim(&trim_top_w, &trim_width_w, &trim_height_w,
+                                    vips::VImage::option() //
+                                      ->set("line_art", true));
+
+      int trim_left_b, trim_top_b, trim_width_b, trim_height_b;
+      trim_left_b = frame.find_trim(&trim_top_b, &trim_width_b, &trim_height_b,
+                                    vips::VImage::option() //
+                                      ->set("line_art", true)
+                                      ->set("background", 0.0));
+
+      trim_left = std::max(trim_left_w, trim_left_b);
+      trim_top = std::max(trim_top_w, trim_top_b);
+      trim_width = std::min(trim_width_w, trim_width_b);
+      trim_height = std::min(trim_height_w, trim_height_b);
     }
 
     if (crop) {
