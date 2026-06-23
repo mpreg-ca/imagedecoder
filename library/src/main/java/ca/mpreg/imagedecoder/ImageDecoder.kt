@@ -68,7 +68,7 @@ class ImageDecoder private constructor(
 
     companion object {
         init {
-            System.loadLibrary("imagedecoder")
+            System.loadLibrary("imagedecoder2")
         }
 
         @JvmStatic

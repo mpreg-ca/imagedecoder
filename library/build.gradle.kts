@@ -7,7 +7,7 @@ val gitCommitId = providers.exec {
     commandLine("git", "rev-parse", "--short", "HEAD")
 }.standardOutput.asText.map { it.trim() }.getOrElse("unknown")
 
-val baseVersion = "4-$gitCommitId"
+val baseVersion = "5-$gitCommitId"
 
 val isTag = System.getenv("GITHUB_REF_TYPE") == "tag"
 
