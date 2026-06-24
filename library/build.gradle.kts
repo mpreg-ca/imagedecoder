@@ -3,13 +3,14 @@ plugins {
     id("com.vanniktech.maven.publish") version "0.36.0"
 }
 
-val gitCommitId = providers.exec {
-    commandLine("git", "rev-parse", "--short", "HEAD")
-}.standardOutput.asText.map { it.trim() }.getOrElse("unknown")
-
-val baseVersion = "5-$gitCommitId"
-
-val isTag = System.getenv("GITHUB_REF_TYPE") == "tag"
+val tag = if (System.getenv("GITHUB_REF_TYPE") == "tag") {
+    System.getenv("GITHUB_REF_NAME")
+} else {
+    val baseVersion = providers.exec {
+        commandLine("git", "rev-parse", "--short", "HEAD")
+    }.standardOutput.asText.map { it.trim() }.getOrElse("unknown")
+    "$baseVersion-SNAPSHOT"
+}
 
 android {
     namespace = "ca.mpreg.imagedecoder"
@@ -45,13 +46,11 @@ android {
     }
 }
 
-dependencies {
-}
+dependencies {}
 
 afterEvaluate {
     mavenPublishing {
-        val version = if (isTag) baseVersion else "$baseVersion-SNAPSHOT"
-        coordinates("ca.mpreg", "imagedecoder", version)
+        coordinates("ca.mpreg", "imagedecoder", tag)
 
         pom {
             name.set("imagedecoder")

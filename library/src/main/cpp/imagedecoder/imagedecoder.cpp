@@ -171,12 +171,25 @@ Java_ca_mpreg_imagedecoder_ImageDecoder_decode(JNIEnv* env, jobject obj, jint pa
     size_t size;
     void* data = frame.write_to_memory(&size);
 
+    if (!data) {
+      env->ThrowNew(env->FindClass("ca/mpreg/imagedecoder/ImageDecoder$DecodeException"),
+                    "Out of memory");
+      return nullptr;
+    }
+
     jobject byteBuffer = env->NewDirectByteBuffer(data, size);
+
+    if (!byteBuffer) {
+      g_free(data);
+      env->ThrowNew(env->FindClass("ca/mpreg/imagedecoder/ImageDecoder$DecodeException"),
+                    "Failed to allocate direct byte buffer");
+      return nullptr;
+    }
 
     jclass cls = env->FindClass("ca/mpreg/imagedecoder/ImageDecoder$DecodeResult");
     jmethodID ctor = env->GetMethodID(cls, "<init>", "(JLjava/nio/ByteBuffer;IIIIIII)V");
-    return env->NewObject(cls, ctor, data, byteBuffer, width, height, duration, trim_left, trim_top,
-                          trim_width, trim_height);
+    return env->NewObject(cls, ctor, (jlong)(intptr_t)data, byteBuffer, width, height, duration,
+                          trim_left, trim_top, trim_width, trim_height);
   } catch (const vips::VError& e) {
     env->ThrowNew(env->FindClass("ca/mpreg/imagedecoder/ImageDecoder$DecodeException"), e.what());
     return nullptr;
@@ -213,7 +226,7 @@ Java_ca_mpreg_imagedecoder_ImageDecoder_encode(JNIEnv* env, jobject obj, jstring
 
     jclass cls = env->FindClass("ca/mpreg/imagedecoder/ImageDecoder$EncodeResult");
     jmethodID ctor = env->GetMethodID(cls, "<init>", "(JLjava/nio/ByteBuffer;)V");
-    return env->NewObject(cls, ctor, data, byteBuffer);
+    return env->NewObject(cls, ctor, (jlong)(intptr_t)data, byteBuffer);
   } catch (const vips::VError& e) {
     env->ThrowNew(env->FindClass("ca/mpreg/imagedecoder/ImageDecoder$DecodeException"), e.what());
     return nullptr;
