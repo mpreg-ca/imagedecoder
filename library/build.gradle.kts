@@ -3,6 +3,8 @@ plugins {
     id("com.vanniktech.maven.publish") version "0.36.0"
 }
 
+val abi: String = findProperty("abi") as String? ?: "arm64-v8a"
+
 val tag = if (System.getenv("GITHUB_REF_TYPE") == "tag") {
     System.getenv("GITHUB_REF_NAME")
 } else {
@@ -18,6 +20,10 @@ android {
 
     defaultConfig {
         minSdk = 24
+
+        ndk {
+            abiFilters += abi
+        }
 
         externalNativeBuild {
             cmake {
@@ -48,37 +54,35 @@ android {
 
 dependencies {}
 
-afterEvaluate {
-    mavenPublishing {
-        coordinates("ca.mpreg", "imagedecoder", tag)
+mavenPublishing {
+    coordinates("ca.mpreg", "imagedecoder-$abi", tag)
 
-        pom {
-            name.set("imagedecoder")
-            description.set("imagedecoder")
-            inceptionYear.set("2026")
-            url.set("https://github.com/mpreg-ca/imagedecoder")
-            licenses {
-                license {
-                    name.set("MIT License")
-                    url.set("https://opensource.org")
-                    distribution.set("repo")
-                }
-            }
-            developers {
-                developer {
-                    id.set("wwww-wwww")
-                    name.set("w")
-                    url.set("https://github.com/wwww-wwww/")
-                }
-            }
-            scm {
-                url.set("https://github.com/mpreg-ca/imagedecoder/")
-                connection.set("scm:git:git://github.com/mpreg-ca/imagedecoder.git")
-                developerConnection.set("scm:git:ssh://git@github.com/mpreg-ca/imagedecoder.git")
+    pom {
+        name.set("imagedecoder-$abi")
+        description.set("imagedecoder native library for $abi")
+        inceptionYear.set("2026")
+        url.set("https://github.com/mpreg-ca/imagedecoder")
+        licenses {
+            license {
+                name.set("MIT License")
+                url.set("https://opensource.org")
+                distribution.set("repo")
             }
         }
-
-        publishToMavenCentral(automaticRelease = true)
-        signAllPublications()
+        developers {
+            developer {
+                id.set("wwww-wwww")
+                name.set("w")
+                url.set("https://github.com/wwww-wwww/")
+            }
+        }
+        scm {
+            url.set("https://github.com/mpreg-ca/imagedecoder/")
+            connection.set("scm:git:git://github.com/mpreg-ca/imagedecoder.git")
+            developerConnection.set("scm:git:ssh://git@github.com/mpreg-ca/imagedecoder.git")
+        }
     }
+
+    publishToMavenCentral(automaticRelease = true)
+    signAllPublications()
 }

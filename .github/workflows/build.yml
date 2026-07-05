@@ -22,6 +22,10 @@ jobs:
       contents: read
       packages: write
 
+    strategy:
+      matrix:
+        abi: [arm64-v8a, armeabi-v7a, x86, x86_64]
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -54,8 +58,8 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install meson
 
-      - name: Publish Artifact
-        run: ./gradlew publishToMavenCentral
+      - name: Publish Artifact (${{ matrix.abi }})
+        run: ./gradlew publishToMavenCentral -Pabi=${{ matrix.abi }}
         env:
           GITHUB_REF_NAME: ${{ github.ref_name }}
           GITHUB_REF_TYPE: ${{ github.ref_type }}
