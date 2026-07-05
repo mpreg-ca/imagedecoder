@@ -4,6 +4,7 @@ plugins {
 }
 
 val abi: String = findProperty("abi") as String? ?: "arm64-v8a"
+val artifactId = if (abi == "all") "imagedecoder" else "imagedecoder-$abi"
 
 val tag = if (System.getenv("GITHUB_REF_TYPE") == "tag") {
     System.getenv("GITHUB_REF_NAME")
@@ -21,8 +22,8 @@ android {
     defaultConfig {
         minSdk = 24
 
-        ndk {
-            abiFilters += abi
+        if (abi != "all") {
+            ndk { abiFilters += abi }
         }
 
         externalNativeBuild {
@@ -55,11 +56,11 @@ android {
 dependencies {}
 
 mavenPublishing {
-    coordinates("ca.mpreg", "imagedecoder-$abi", tag)
+    coordinates("ca.mpreg", artifactId, tag)
 
     pom {
-        name.set("imagedecoder-$abi")
-        description.set("imagedecoder native library for $abi")
+        name.set(artifactId)
+        description.set("imagedecoder")
         inceptionYear.set("2026")
         url.set("https://github.com/mpreg-ca/imagedecoder")
         licenses {
