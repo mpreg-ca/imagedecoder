@@ -4,7 +4,7 @@ set(ENV{PKG_CONFIG_PATH} "${THIRD_PARTY_LIB_PATH}/lib/pkgconfig")
 
 ExternalProject_Add(ep_libheif
     GIT_REPOSITORY https://github.com/strukturag/libheif
-    GIT_TAG v1.23.1
+    GIT_TAG v1.23.4
     DEPENDS ep_zlib ep_libde265 ep_dav1d ep_libwebp
     CMAKE_ARGS
         ${EP_CMAKE_ARGS}

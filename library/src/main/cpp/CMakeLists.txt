@@ -143,6 +143,7 @@ include("cmake/libjpeg-turbo.cmake")
 include("cmake/libopenjp2.cmake")
 include("cmake/libpng.cmake")
 include("cmake/libtiff.cmake")
+include("cmake/libultrahdr.cmake")
 
 include("cmake/dav1d.cmake")
 include("cmake/libde265.cmake")
