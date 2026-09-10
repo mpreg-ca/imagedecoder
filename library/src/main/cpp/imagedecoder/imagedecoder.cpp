@@ -519,6 +519,21 @@ Java_ca_mpreg_imagedecoder_ImageDecoder_decode(JNIEnv* env, jobject obj, jint pa
         ->set("access", (crop || getTrim) ? VIPS_ACCESS_RANDOM : VIPS_ACCESS_SEQUENTIAL)
         ->set("page", page));
 
+    if (frame.get_typeof(VIPS_META_ORIENTATION) != 0) {
+      int orientation = frame.get_int(VIPS_META_ORIENTATION);
+      frame = frame.copy_memory().autorot();
+
+      if (VipsImage* gainmap = vips_image_get_gainmap(frame.get_image())) {
+        vips_image_set_int(gainmap, VIPS_META_ORIENTATION, orientation);
+        VipsImage* rotated;
+        if (!vips_autorot(gainmap, &rotated, nullptr)) {
+          vips_image_set_image(frame.get_image(), "gainmap", rotated);
+          g_object_unref(rotated);
+        }
+        g_object_unref(gainmap);
+      }
+    }
+
     /* A gainmap's base is 8-bit sRGB; only the transfer-function paths hand back float. */
     const bool float_out = decoder->hdr_kind == HDR_PQ || decoder->hdr_kind == HDR_HLG ||
                            decoder->hdr_kind == HDR_LINEAR;
@@ -647,6 +662,21 @@ Java_ca_mpreg_imagedecoder_ImageDecoder_encode(JNIEnv* env, jobject obj, jstring
   try {
     vips::VImage frame = vips::VImage::new_from_buffer(decoder->buffer, decoder->buffer_size, "",
                                                        vips::VImage::option()->set("page", page));
+
+    if (frame.get_typeof(VIPS_META_ORIENTATION) != 0) {
+      int orientation = frame.get_int(VIPS_META_ORIENTATION);
+      frame = frame.copy_memory().autorot();
+
+      if (VipsImage* gainmap = vips_image_get_gainmap(frame.get_image())) {
+        vips_image_set_int(gainmap, VIPS_META_ORIENTATION, orientation);
+        VipsImage* rotated;
+        if (!vips_autorot(gainmap, &rotated, nullptr)) {
+          vips_image_set_image(frame.get_image(), "gainmap", rotated);
+          g_object_unref(rotated);
+        }
+        g_object_unref(gainmap);
+      }
+    }
 
     size_t size;
     void* data;

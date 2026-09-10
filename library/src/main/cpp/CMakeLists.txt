@@ -155,6 +155,7 @@ include("cmake/libjxl.cmake")
 
 include("cmake/libffi.cmake")
 include("cmake/libiconv.cmake")
+include("cmake/libexif.cmake")
 include("cmake/glib.cmake")
 
 include("cmake/libexpat.cmake")

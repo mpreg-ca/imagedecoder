@@ -45,6 +45,11 @@ jobs:
           sudo apt update
           sudo apt install \
             build-essential \
+            autoconf \
+            automake \
+            libtool \
+            gettext \
+            autopoint \
             ninja-build \
             nasm \
             libltdl-dev \

@@ -31,6 +31,7 @@ target_link_libraries(imagedecoder2
     dav1d
     uhdr
     jxl
+    exif
     -static-libgcc
     -static-libstdc++
 )
