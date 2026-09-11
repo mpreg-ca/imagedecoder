@@ -1,19 +1,40 @@
 package ca.mpreg.imagedecoder
 
+import java.io.Closeable
 import java.io.InputStream
 import java.nio.ByteBuffer
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.log2
 import kotlin.math.pow
 
+/**
+ * Decodes one image, held in native memory for the life of the object.
+ *
+ * The collector has no idea how large that buffer is, so leaving it to the finalizer is what
+ * turns a decode loop into an OOM. [close] is idempotent and safe to call from any thread.
+ */
 class ImageDecoder private constructor(
-    private val ptr: Long,
-    val pages: Int,
-    var page: Int,
+    // Read and cleared by native code; see nativeFree.
+    private var ptr: Long,
+    pages: Int,
+    page: Int,
     val isHdr: Boolean,
     private val hdrKindRaw: Int,
     val hdrHeadroom: Float,
     private val loader: String,
-) {
+) : Closeable {
+    /** At least 1: zero would make [decodeNext] divide by zero. */
+    val pages: Int = if (pages > 0) pages else 1
+
+    /** Next page [decodeNext] will hand back, always in `0 until pages`. */
+    var page: Int = page.coerceIn(0, this.pages - 1)
+        set(value) {
+            require(value in 0 until pages) { "page $value out of range 0 until $pages" }
+            field = value
+        }
+
+    private val closed = AtomicBoolean(false)
+
     /**
      * Normalized image format derived from the libvips loader name.
      *
@@ -82,9 +103,18 @@ class ImageDecoder private constructor(
         val offsetSdr: FloatArray,
         val offsetHdr: FloatArray,
     ) {
+        init {
+            // A short array would index out of bounds in gainFor, far from whatever produced it.
+            require(
+                gamma.size >= 3 && minContentBoost.size >= 3 && maxContentBoost.size >= 3 &&
+                        offsetSdr.size >= 3 && offsetHdr.size >= 3
+            ) { "gainmap metadata arrays must hold three entries" }
+            require(width > 0 && height > 0 && channels > 0) { "empty gainmap" }
+        }
+
         val headroomStops: Float
-            get() = maxContentBoost.maxOrNull()?.takeIf { it > 1f }?.let { kotlin.math.log2(it) }
-                ?: 0f
+            get() = maxContentBoost.maxOrNull()?.takeIf { it.isFinite() && it > 1f }
+                ?.let { log2(it) } ?: 0f
 
         /**
          * Reference arithmetic, matching libultrahdr's `applyGain` - for a caller applying the
@@ -93,8 +123,16 @@ class ImageDecoder private constructor(
         fun gainFor(value: Int, channel: Int): Float {
             val i = channel.coerceIn(0, 2)
             var g = (value and 0xFF) / 255f
-            if (gamma[i] != 1f) g = g.pow(1f / gamma[i])
-            val logBoost = log2(minContentBoost[i]) * (1f - g) + log2(maxContentBoost[i]) * g
+
+            // Zero divides by zero, and a negative lands on NaN.
+            val gammaI = gamma[i]
+            if (gammaI != 1f && gammaI > 0f && gammaI.isFinite()) g = g.pow(1f / gammaI)
+
+            // log2 of a non-positive boost is -Inf or NaN, and this multiplies every highlight.
+            val minBoost = minContentBoost[i].takeIf { it.isFinite() && it > 0f } ?: 1f
+            val maxBoost = maxContentBoost[i].takeIf { it.isFinite() && it > 0f } ?: 1f
+
+            val logBoost = log2(minBoost) * (1f - g) + log2(maxBoost) * g
             return 2f.pow(logBoost)
         }
 
@@ -108,6 +146,13 @@ class ImageDecoder private constructor(
     open class DecodeException internal constructor(message: String) : Exception(message)
 
     class UnknownFormatException internal constructor(message: String) : DecodeException(message)
+
+    /**
+     * The image did not fit in memory, or is larger than this decoder will allocate for one
+     * picture. Thrown instead of [OutOfMemoryError] so a caller decoding untrusted input can skip
+     * the file rather than unwind its whole thread.
+     */
+    class OutOfMemoryException internal constructor(message: String) : DecodeException(message)
 
     class DecodeResult private constructor(
         val image: ByteBuffer,
@@ -147,42 +192,102 @@ class ImageDecoder private constructor(
         return res
     }
 
+    /**
+     * @throws OutOfMemoryException if the decoded image does not fit in memory.
+     * @throws DecodeException if the file is malformed, or this decoder is closed.
+     */
     @Synchronized
     @Throws(DecodeException::class)
-    external fun decode(
-        page: Int = 0, crop: Boolean = false, getTrim: Boolean = false
-    ): DecodeResult
+    fun decode(page: Int = 0, crop: Boolean = false, getTrim: Boolean = false): DecodeResult {
+        checkOpen()
+        if (page < 0 || page >= pages) {
+            throw DecodeException("page $page out of range 0 until $pages")
+        }
+        return nativeDecode(page, crop, getTrim)
+    }
 
+    private external fun nativeDecode(page: Int, crop: Boolean, getTrim: Boolean): DecodeResult
+
+    /** Bytes of a re-encoded image, in native memory. [close] frees them. */
     class EncodeResult private constructor(
-        private val ptr: Long,
-        val bytes: ByteBuffer,
-    ) {
-        protected fun finalize() {
-            free()
+        private var ptr: Long,
+        private val buffer: ByteBuffer,
+    ) : Closeable {
+        private val closed = AtomicBoolean(false)
+
+        /** Valid until [close]; copy anything that has to outlive this object. */
+        val bytes: ByteBuffer
+            get() {
+                check(!closed.get()) { "EncodeResult has been closed" }
+                return buffer
+            }
+
+        override fun close() {
+            if (closed.compareAndSet(false, true)) nativeFree()
         }
 
-        private external fun free()
+        @Deprecated("Call close(); the finalizer only catches a caller who forgot.")
+        protected fun finalize() {
+            close()
+        }
+
+        private external fun nativeFree()
     }
 
+    /**
+     * @throws OutOfMemoryException if the encoded image does not fit in memory.
+     * @throws DecodeException if encoding fails, or this decoder is closed.
+     */
     @Synchronized
     @Throws(DecodeException::class)
-    external fun encode(suffix: String, page: Int = -1): EncodeResult
-
-    protected fun finalize() {
-        synchronized(this) {
-            free()
+    fun encode(suffix: String, page: Int = -1): EncodeResult {
+        checkOpen()
+        if (page < -1 || page >= pages) {
+            throw DecodeException("page $page out of range -1 until $pages")
         }
+        return nativeEncode(suffix, page)
     }
 
-    private external fun free()
+    private external fun nativeEncode(suffix: String, page: Int): EncodeResult
+
+    /**
+     * Releases the native image buffer. Idempotent; a later [decode] or [encode] throws
+     * [DecodeException] rather than reading freed memory.
+     */
+    override fun close() {
+        if (!closed.compareAndSet(false, true)) return
+        // The monitor, not just the flag: a decode in flight is still reading the buffer.
+        synchronized(this) { nativeFree() }
+    }
+
+    private fun checkOpen() {
+        if (closed.get() || ptr == 0L) throw DecodeException("ImageDecoder has been closed")
+    }
+
+    @Deprecated("Call close(); the finalizer only catches a caller who forgot.")
+    protected fun finalize() {
+        close()
+    }
+
+    private external fun nativeFree()
 
     companion object {
         init {
             System.loadLibrary("imagedecoder2")
         }
 
+        /**
+         * Reads [inputStream] to the end and parses its header, leaving it open for the caller
+         * to close.
+         *
+         * @throws OutOfMemoryException if the image is larger than the decoder will buffer.
+         * @throws UnknownFormatException if the bytes are not a supported image.
+         */
         @JvmStatic
         @Throws(DecodeException::class)
-        external fun new(inputStream: InputStream): ImageDecoder
+        fun new(inputStream: InputStream): ImageDecoder = nativeNew(inputStream)
+
+        @JvmStatic
+        private external fun nativeNew(inputStream: InputStream): ImageDecoder
     }
 }

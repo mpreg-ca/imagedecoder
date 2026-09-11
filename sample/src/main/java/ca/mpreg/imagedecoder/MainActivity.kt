@@ -27,9 +27,12 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         CoroutineScope(Dispatchers.Default).launch {
-            val stream = assets.open("anim-icos.gif")
-            val decoder = ImageDecoder.new(stream)
-            decoder.decode()
+            // Both hold off-heap buffers the collector cannot size.
+            assets.open("anim-icos.gif").use { stream ->
+                ImageDecoder.new(stream).use { decoder ->
+                    decoder.decode()
+                }
+            }
         }
 
         enableEdgeToEdge()
