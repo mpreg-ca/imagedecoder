@@ -208,6 +208,26 @@ class ImageDecoder private constructor(
 
     private external fun nativeDecode(page: Int, crop: Boolean, getTrim: Boolean): DecodeResult
 
+    /** Exif and tiff tag names of the main image, in file order; no value is parsed. */
+    @Synchronized
+    @Throws(DecodeException::class)
+    fun listTags(): List<String> {
+        checkOpen()
+        return nativeListTags().asList()
+    }
+
+    /** Null if the image carries no [name]; several components read as "8, 8, 8". */
+    @Synchronized
+    @Throws(DecodeException::class)
+    fun getTag(name: String): String? {
+        checkOpen()
+        return nativeGetTag(name)
+    }
+
+    private external fun nativeListTags(): Array<String>
+
+    private external fun nativeGetTag(name: String): String?
+
     /** Bytes of a re-encoded image, in native memory. [close] frees them. */
     class EncodeResult private constructor(
         private var ptr: Long,

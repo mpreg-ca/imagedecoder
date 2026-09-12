@@ -1,5 +1,6 @@
 #include <limits.h>
 #include <stdint.h>
+#include <string.h>
 #include <string>
 #include <vector>
 
@@ -7,6 +8,7 @@
 #include <jni.h>
 #include <vips/vips8>
 
+#include "exif.h"
 #include "hdr.h"
 
 using namespace vips;
@@ -239,6 +241,12 @@ struct Decoder
 
   /* For the PQ/HLG paths, straight from the container. */
   ColourSignal signal;
+
+  /* Raw TIFF metadata for listTags/getTag: into [buffer] for a TIFF, else at [exif_owned], a copy
+   * because the blob it came from dies with the VImage. */
+  const uint8_t* exif_data;
+  size_t exif_size;
+  uint8_t* exif_owned;
 };
 
 static Decoder*
@@ -254,6 +262,7 @@ decoder_free(Decoder* d)
     return;
   g_free(d->buffer);
   g_free(d->durations);
+  g_free(d->exif_owned);
   g_free(d);
 }
 
@@ -585,6 +594,9 @@ Java_ca_mpreg_imagedecoder_ImageDecoder_nativeNew(JNIEnv* env, jclass, jobject j
       image.get_typeof("vips-loader") != 0 ? image.get_string("vips-loader") : "";
     std::string loader_str = loader_cstr ? loader_cstr : "";
 
+    decoder->exif_owned = exif_bytes(image, decoder->buffer, decoder->buffer_size,
+                                     &decoder->exif_data, &decoder->exif_size);
+
     image = vips::VImage();
 
     jstring jloader = env->NewStringUTF(loader_str.c_str());
@@ -629,6 +641,72 @@ Java_ca_mpreg_imagedecoder_ImageDecoder_nativeNew(JNIEnv* env, jclass, jobject j
     decoder_free(decoder);
     vips_error_clear();
     throw_decode_error(env, EXC_DECODE, "Unknown error reading the image header");
+    return nullptr;
+  }
+}
+
+/* Released however this returns, a throw from the walk included. */
+struct Utf8Chars
+{
+  JNIEnv* env;
+  jstring owner;
+  const char* chars;
+
+  ~Utf8Chars()
+  {
+    if (chars)
+      env->ReleaseStringUTFChars(owner, chars);
+  }
+};
+
+extern "C" JNIEXPORT jobjectArray JNICALL
+Java_ca_mpreg_imagedecoder_ImageDecoder_nativeListTags(JNIEnv* env, jobject obj)
+{
+  try {
+    Decoder* decoder = decoder_for(env, obj);
+    jobjectArray tags = exif_list_tags(env, decoder->exif_data, decoder->exif_size);
+
+    /* Null with no pending exception means the VM refused an allocation. */
+    if (!tags && !env->ExceptionCheck())
+      fail(EXC_OOM, "Out of memory listing the tags");
+
+    return tags;
+  } catch (const DecodeError& e) {
+    throw_decode_error(env, e.cls, e.msg.c_str());
+    return nullptr;
+  } catch (const std::bad_alloc&) {
+    throw_decode_error(env, EXC_OOM, "Out of memory listing the tags");
+    return nullptr;
+  } catch (...) {
+    throw_decode_error(env, EXC_DECODE, "Unknown error listing the tags");
+    return nullptr;
+  }
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_ca_mpreg_imagedecoder_ImageDecoder_nativeGetTag(JNIEnv* env, jobject obj, jstring jname)
+{
+  try {
+    Decoder* decoder = decoder_for(env, obj);
+    if (!decoder->exif_data || !jname)
+      return nullptr;
+
+    Utf8Chars name = { env, jname, env->GetStringUTFChars(jname, nullptr) };
+    if (!name.chars) {
+      if (env->ExceptionCheck())
+        env->ExceptionClear();
+      fail(EXC_OOM, "Out of memory reading the tag name");
+    }
+
+    return exif_get_tag(env, decoder->exif_data, decoder->exif_size, name.chars);
+  } catch (const DecodeError& e) {
+    throw_decode_error(env, e.cls, e.msg.c_str());
+    return nullptr;
+  } catch (const std::bad_alloc&) {
+    throw_decode_error(env, EXC_OOM, "Out of memory reading the tag");
+    return nullptr;
+  } catch (...) {
+    throw_decode_error(env, EXC_DECODE, "Unknown error reading the tag");
     return nullptr;
   }
 }
