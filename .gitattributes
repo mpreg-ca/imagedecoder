@@ -1,0 +1,14 @@
+# Normalise to LF in the repository, whatever the checkout platform does.
+#
+# Two things here bite otherwise. A CRLF shebang makes the kernel look for
+# an interpreter called "/bin/sh\r", which fails with a message that never
+# mentions newlines. And the dependency pin hash - the key for the prebuilt
+# tarballs and the CI cache - is taken over the bytes of cmake/*.cmake, so
+# a checkout that disagreed about line endings would compute a different
+# hash and silently miss every cache and every prebuilt.
+* text=auto eol=lf
+
+*.bat text eol=crlf
+*.sh text eol=lf
+gradlew text eol=lf
+*.jar binary

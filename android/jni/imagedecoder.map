@@ -1,0 +1,13 @@
+/* JNI entry points are the whole public surface; hiding the rest saves
+ * ~1MB of symbol tables/relocations and lets --gc-sections work at all
+ * (an exported symbol is a GC root).
+ *
+ * A pattern, not explicit names: this library registers natives by
+ * discovery rather than JNI_OnLoad, and naming an undefined symbol
+ * would be a link error. */
+{
+  global:
+    Java_*;
+  local:
+    *;
+};

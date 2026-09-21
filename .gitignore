@@ -1,0 +1,12 @@
+/build/
+/.source/
+/android/.gradle/
+/.idea/
+/android/.kotlin/
+/android/local.properties
+**/build/
+/android/library/.cxx/
+/subprojects/*/
+!/subprojects/packagefiles/
+/dist/
+/android/.idea

@@ -1,0 +1,266 @@
+name: Prebuilt dependencies
+
+# Run by hand: the pinned dependencies' build output only changes with
+# cmake/*.cmake, so there's no reason to spend five platforms x ~25 min on
+# every push.
+#
+# Publishes a release tagged deps-<pin hash>, letting builds find a matching
+# matching tarball or fall back to source.
+# Re-running for an unchanged hash just replaces the existing release's assets.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ${{ matrix.runner }}
+    # Each tarball is valid only for a matching platform/C runtime, so the
+    # Linux ones build inside the same manylinux/musllinux images
+    # cibuildwheel uses - a tarball built on the runner's own glibc wouldn't
+    # link inside the container that consumes it.
+    #
+    # Run through docker, not a job-level container: JavaScript actions
+    # (checkout, upload-artifact) can't run inside an Alpine container on an
+    # arm64 runner. Keeping those on the host and only the build in the
+    # container keeps one code path for all four Linux images.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Both needed: a glibc tarball won't link inside a musl image.
+          # Built in the very images that consume them.
+          - runner: ubuntu-26.04
+            container: quay.io/pypa/manylinux_2_28_x86_64
+            os: linux
+            arch: x86_64
+            libc: glibc
+          - runner: ubuntu-26.04-arm
+            container: quay.io/pypa/manylinux_2_28_aarch64
+            os: linux
+            arch: aarch64
+            libc: glibc
+          - runner: ubuntu-26.04
+            container: quay.io/pypa/musllinux_1_2_x86_64
+            os: linux
+            arch: x86_64
+            libc: musl
+          - runner: ubuntu-26.04-arm
+            container: quay.io/pypa/musllinux_1_2_aarch64
+            os: linux
+            arch: aarch64
+            libc: musl
+          - runner: macos-26
+            pkg: brew
+            deployment: "11.0"
+            os: darwin
+            arch: arm64
+            libc: libc++
+          - runner: macos-26-intel
+            pkg: brew
+            deployment: "10.13"
+            os: darwin
+            arch: x86_64
+            libc: libc++
+          - runner: windows-latest
+            pkg: pip
+            os: windows
+            arch: x86_64
+            libc: msvc
+          # The Android library's gradle build drives the same superbuild, so
+          # these tarballs shorten that CI run too. All four NDK ABIs, so
+          # widening abiFilters later needs no changes here.
+          #
+          # Explicit naming since these are cross builds: uname on the runner
+          # would say linux/x86_64, which the archives aren't.
+          - runner: ubuntu-26.04
+            pkg: apt
+            android_abi: arm64-v8a
+            os: android
+            arch: arm64-v8a
+            libc: bionic
+          - runner: ubuntu-26.04
+            pkg: apt
+            android_abi: armeabi-v7a
+            os: android
+            arch: armeabi-v7a
+            libc: bionic
+          - runner: ubuntu-26.04
+            pkg: apt
+            android_abi: x86
+            os: android
+            arch: x86
+            libc: bionic
+          - runner: ubuntu-26.04
+            pkg: apt
+            android_abi: x86_64
+            os: android
+            arch: x86_64
+            libc: bionic
+          # The wasm module's dependencies. The Emscripten release is part of
+          # the name, since objects only link with the one that built them;
+          # keep it in step with build.yml's EMSDK_VERSION.
+          - runner: ubuntu-26.04
+            pkg: emsdk
+            emsdk: 6.0.10
+            os: emscripten
+            arch: wasm32
+            libc: em6.0.10
+            wasm_threads: 'ON'
+          # The same without pthreads, for imagedecoder-nothreads: objects
+          # built with atomics won't link into a module without shared memory.
+          - runner: ubuntu-26.04
+            pkg: emsdk
+            emsdk: 6.0.10
+            os: emscripten
+            arch: wasm32
+            libc: em6.0.10-nothreads
+            wasm_threads: 'OFF'
+    steps:
+      - uses: actions/checkout@v6
+
+      # No nasm here: macOS ships a 2001-era 0.98 that precedes Homebrew's on
+      # the Intel runner, so the superbuild pins its own instead.
+      - name: Install build dependencies (macOS)
+        if: matrix.pkg == 'brew'
+        run: brew install ninja meson
+
+      # From pip: the chocolatey meson wasn't callable. No nasm either - the
+      # superbuild pins its own.
+      - name: Install build dependencies (Windows)
+        if: matrix.pkg == 'pip'
+        shell: pwsh
+        run: python -m pip install --upgrade meson ninja
+
+      - name: Install build dependencies (Emscripten host)
+        if: matrix.pkg == 'emsdk'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build meson
+
+      - uses: mymindstorm/setup-emsdk@v14
+        if: matrix.pkg == 'emsdk'
+        with:
+          version: ${{ matrix.emsdk }}
+
+      - name: Install build dependencies (Android host)
+        if: matrix.pkg == 'apt'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build nasm meson
+
+      - uses: android-actions/setup-android@v4
+        if: matrix.os == 'android'
+        with:
+          packages: ""
+
+      # One script for both PyPA images: /usr/bin/python3 has no pip, so
+      # build tools come from /opt/python's wheel, sidestepping ninja being
+      # packaged as "ninja-build" on RHEL, a name meson doesn't look for.
+      - name: Build and pack (Linux container)
+        if: matrix.container != ''
+        env:
+          PREBUILT_OS: ${{ matrix.os }}
+          PREBUILT_ARCH: ${{ matrix.arch }}
+          PREBUILT_LIBC: ${{ matrix.libc }}
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w \
+            -e PREBUILT_OS -e PREBUILT_ARCH -e PREBUILT_LIBC \
+            "${{ matrix.container }}" sh -c '
+            set -eu
+            if command -v dnf >/dev/null; then dnf install -y nasm
+            else apk add --no-cache nasm build-base
+            fi
+            pybin=$(ls -d /opt/python/cp31*/bin | tail -1)
+            "$pybin/pip" install --upgrade cmake ninja meson
+            export PATH="$pybin:$PATH"
+            cmake -S . -B build
+            cmake --build build --target imagedecoder_deps -j"$(nproc)"
+            sh tools/make-prebuilt.sh build dist
+          '
+
+      # Ninja, not the default Visual Studio generator, so Windows stays
+      # single-config like every other platform: one CMAKE_BUILD_TYPE, no
+      # --config to keep in step across the superbuild's sub-builds.
+      #
+      # Needs cl on PATH, via vcvars64; vswhere finds it without naming an
+      # edition or year, both of which change with the runner image.
+      - name: Build the dependencies (Windows)
+        if: matrix.pkg == 'pip'
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do set "VSDIR=%%i"
+          if not defined VSDIR exit /b 1
+          call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          cmake -S . -B build -G Ninja || exit /b 1
+          cmake --build build --target imagedecoder_deps || exit /b 1
+
+      - name: Build the dependencies
+        if: matrix.container == '' && matrix.pkg != 'pip'
+        shell: bash
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment }}
+        run: |
+          if [ "${{ matrix.pkg }}" = emsdk ]; then
+            emcmake cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+              -DIMAGEDECODER_WASM_THREADS=${{ matrix.wasm_threads }}
+          elif [ -n "${{ matrix.android_abi }}" ]; then
+            ndk=$(ls -d "$ANDROID_HOME"/ndk/* | tail -1)
+            cmake -S . -B build \
+              -DCMAKE_TOOLCHAIN_FILE="$ndk/build/cmake/android.toolchain.cmake" \
+              -DANDROID_ABI="${{ matrix.android_abi }}" \
+              -DANDROID_PLATFORM=android-24
+          else
+            cmake -S . -B build
+          fi
+          cmake --build build --target imagedecoder_deps \
+            -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
+
+      - name: Pack
+        if: matrix.container == ''
+        shell: bash
+        env:
+          PREBUILT_OS: ${{ matrix.os }}
+          PREBUILT_ARCH: ${{ matrix.arch }}
+          PREBUILT_LIBC: ${{ matrix.libc }}
+        run: sh tools/make-prebuilt.sh build dist
+
+      # Named for the target, not the runner: same triple the tarball
+      # carries, so a missing platform is obvious from the list.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: deps-${{ matrix.os }}-${{ matrix.arch }}-${{ matrix.libc }}
+          path: dist/*
+          if-no-files-found: error
+
+  # Only after every platform succeeds, so a release never contains a partial pin set.
+  publish:
+    needs: build
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - id: pins
+        run: echo "hash=$(sh tools/dep-pins.sh)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish the tarballs
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: deps-${{ steps.pins.outputs.hash }}
+          name: Prebuilt dependencies ${{ steps.pins.outputs.hash }}
+          body: |
+            Third-party dependencies for imagedecoder, built from the pins in
+            `cmake/*.cmake` (hash `${{ steps.pins.outputs.hash }}`).
+
+            Each tarball is valid only for a matching platform and C runtime.
+            Unpack it and configure with
+            `-DIMAGEDECODER_PREBUILT_DEPS=<unpacked dir>`; verify against the
+            `.sha256` beside it. `MANIFEST.txt` inside records every
+            dependency version.
+          files: dist/*

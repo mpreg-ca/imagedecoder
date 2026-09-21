@@ -1,0 +1,198 @@
+name: Build
+
+on:
+  push:
+    branches: [master]
+    tags: ["*"]
+    paths-ignore: ["**.md"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Portable core, built for the host: catches compile errors the Android
+  # cross build wouldn't, and proves the prebuilt dependency path configures.
+  host:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ninja-build nasm meson
+
+      # The pinned dependencies' build output is a pure function of
+      # cmake/*.cmake, so caching keys on exactly that (same hash the prebuilt
+      # tarballs use): a pin change rebuilds, anything else restores in seconds.
+      - name: Dependency pin hash
+        id: pins
+        run: echo "hash=$(sh tools/dep-pins.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache built dependencies
+        uses: actions/cache@v6
+        with:
+          # Not our own builds: they rebuild every run, and their CMake caches
+          # hold this checkout's absolute paths.
+          path: |
+            build/fakeroot
+            !build/fakeroot/src/ep_imagedecoder*
+          key: deps-v2-linux-x86_64-${{ steps.pins.outputs.hash }}
+
+      # Library only - cli/ is an example, not a deliverable.
+      # FETCH_PREBUILT_DEPS downloads the release built for this pin set
+      # instead of compiling it (~25 min); falls back to source if none exists yet.
+      - name: Build
+        run: |
+          cmake -S . -B build \
+            -DIMAGEDECODER_FETCH_PREBUILT_DEPS=ON \
+            -DIMAGEDECODER_PREBUILT_REPO="$GITHUB_REPOSITORY"
+          cmake --build build --target ep_imagedecoder -j"$(nproc)"
+
+  # The JavaScript module (imagedecoder.js + .wasm), threaded, then a Node
+  # smoke test: every format decodes, and streamed matches whole.
+  wasm:
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - threads: 'ON'
+            name: imagedecoder
+          - threads: 'OFF'
+            name: imagedecoder-nothreads
+    env:
+      EMSDK_VERSION: 6.0.10
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ninja-build meson imagemagick
+
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: ${{ env.EMSDK_VERSION }}
+          actions-cache-folder: emsdk-cache
+
+      # The pins, plus the files holding the wasm build flags (which the pin
+      # hash ignores), plus the compiler: any of them changes the objects.
+      - name: Dependency pin hash
+        id: pins
+        run: echo "hash=$(sh tools/dep-pins.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache built dependencies
+        uses: actions/cache@v6
+        with:
+          # As above; here their caches also hold emsdk's per-run _temp path.
+          path: |
+            build-wasm/fakeroot
+            !build-wasm/fakeroot/src/ep_imagedecoder*
+          key: deps-v2-wasm-${{ matrix.threads }}-${{ env.EMSDK_VERSION }}-${{ steps.pins.outputs.hash }}-${{ hashFiles('CMakeLists.txt', 'cmake/**') }}
+
+      # FETCH_PREBUILT_DEPS downloads the tarball published for these pins and
+      # this Emscripten; without one (pins just changed) it builds from source,
+      # which the cache above then keeps.
+      - name: Build
+        run: |
+          emcmake cmake -S . -B build-wasm -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DIMAGEDECODER_WASM_THREADS=${{ matrix.threads }} \
+            -DIMAGEDECODER_FETCH_PREBUILT_DEPS=ON \
+            -DIMAGEDECODER_PREBUILT_REPO="$GITHUB_REPOSITORY"
+          cmake --build build-wasm -j"$(nproc)"
+
+      - name: Smoke test
+        run: |
+          mkdir -p corpus
+          # ImageMagick 7 is magick; an older package only has convert.
+          magick() { if type -P magick >/dev/null; then command magick "$@"; else convert "$@"; fi; }
+          magick -size 61x37 gradient:red-blue                corpus/rgb.png
+          magick -size 61x37 gradient:red-blue -depth 16      corpus/rgb16.png
+          magick -size 61x37 gradient:red-blue -interlace JPEG corpus/progressive.jpg
+          magick -size 61x37 gradient:red-blue                corpus/rgb.webp
+          magick -size 61x37 gradient:red-blue -depth 16      corpus/rgb16.tif
+          magick -size 40x30 xc:red -size 40x30 xc:lime -size 40x30 xc:blue \
+                 -delay 10 -loop 0                            corpus/anim.gif
+          node wasm/smoke-test.mjs build-wasm/fakeroot/wasm/${{ matrix.name }}.js corpus/*
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.name }}-wasm-${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
+          path: |
+            build-wasm/fakeroot/wasm/${{ matrix.name }}.js
+            build-wasm/fakeroot/wasm/${{ matrix.name }}.wasm
+
+  # The Android library, plus the JNI check (needs the .so and Kotlin already built).
+  android:
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-java@v6
+        with:
+          java-version: 17
+          distribution: temurin
+
+      # Empty on purpose: the action's default installs the legacy "tools"
+      # package, which Google removed, failing sdkmanager outright. The
+      # runner image already has the SDK and NDK.
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: ""
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ninja-build nasm meson unzip
+
+      - name: Dependency pin hash
+        id: pins
+        run: echo "hash=$(sh tools/dep-pins.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache built dependencies
+        uses: actions/cache@v6
+        with:
+          # Gradle's CMake tree is path-bound throughout, so keyed on the checkout.
+          path: android/library/.cxx
+          key: deps-v2-android-${{ github.event.repository.name }}-${{ steps.pins.outputs.hash }}
+
+      - name: Build the AAR
+        working-directory: android
+        run: sh gradlew :library:assembleRelease
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_REF_TYPE: ${{ github.ref_type }}
+
+      # A wrong JNI signature compiles/links cleanly and fails only at call time.
+      - name: Check JNI bindings
+        run: sh tools/check-jni.sh
+
+      # Every build leaves a downloadable AAR; an untagged one is versioned
+      # <short sha>-SNAPSHOT by the gradle module.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: imagedecoder-aar-${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
+          path: android/library/build/outputs/aar/*.aar
+          if-no-files-found: error
+
+      # Only a tagged build publishes to Maven Central under the tag.
+      - name: Publish to Maven Central
+        if: github.ref_type == 'tag'
+        working-directory: android
+        run: sh gradlew publishToMavenCentral
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_REF_TYPE: ${{ github.ref_type }}
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVENCENTRALUSERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVENCENTRALPASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNINGINMEMORYKEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNINGINMEMORYKEYPASSWORD }}

@@ -1,0 +1,44 @@
+include(ExternalProject)
+
+# Its tile threads would fail to start without pthreads.
+set(LIBHEIF_THREAD_ARGS)
+if(EMSCRIPTEN AND NOT IMAGEDECODER_WASM_THREADS)
+    set(LIBHEIF_THREAD_ARGS -DENABLE_MULTITHREADING_SUPPORT=OFF)
+endif()
+
+set(ENV{PKG_CONFIG_PATH} "${THIRD_PARTY_LIB_PATH}/lib/pkgconfig")
+
+ExternalProject_Add(ep_libheif
+    GIT_REPOSITORY https://github.com/strukturag/libheif
+    GIT_TAG v1.23.4
+    DEPENDS ep_zlib ep_libde265
+    CMAKE_ARGS
+        ${EP_CMAKE_ARGS}
+        ${EP_SIZE_ARGS}
+        ${LIBHEIF_THREAD_ARGS}
+        -DWITH_EXAMPLES=OFF
+        -DWITH_EXAMPLE_HEIF_THUMB=OFF
+        -DWITH_EXAMPLE_HEIF_VIEW=OFF
+        -DWITH_GDK_PIXBUF=OFF
+        -DBUILD_DOCUMENTATION=OFF
+        -DENABLE_PLUGIN_LOADING=OFF
+        -DWITH_DAV1D=OFF
+        -DWITH_LIBDE265=ON
+        -DWITH_AOM_DECODER=OFF
+        -DWITH_AOM_ENCODER=OFF
+        -DWITH_X264=OFF
+        -DWITH_X265=OFF
+        -DWITH_SvtEnc=OFF
+        -DWITH_RAV1E=OFF
+        -DWITH_KVAZAAR=OFF
+        -DWITH_FFMPEG_DECODER=OFF
+        -DWITH_JPEG_DECODER=OFF
+        -DWITH_JPEG_ENCODER=OFF
+        -DWITH_OpenJPEG_DECODER=OFF
+        -DWITH_OpenJPEG_ENCODER=OFF
+        -DWITH_OPENJPH_ENCODER=OFF
+        -DWITH_UVG266=OFF
+        -DWITH_VVDEC=OFF
+        -DWITH_VVENC=OFF
+        -DWITH_LIBSHARPYUV=OFF
+)
