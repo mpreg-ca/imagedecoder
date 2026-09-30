@@ -129,7 +129,7 @@ public:
     guard([&] {
       check_open();
       if (!m_more) {
-        js_throw("No frames remain");
+        js_throw("No more frames");
       }
       out = decode_step();
     });
@@ -213,6 +213,24 @@ public:
       }
     });
     return out;
+  }
+
+  // Back to frame 0 over the bytes already held, to replay an animation.
+  void rewind() {
+    guard([&] {
+      check_open();
+      if (!m_decoder || !m_complete) {
+        js_throw("Rewinding needs the whole file: call markComplete() first");
+      }
+      try {
+        m_decoder->rewind();
+      } catch (...) {
+        m_more = false; // A failed rewind is final.
+        throw;
+      }
+      m_more = true;
+      m_page = 0;
+    });
   }
 
   // Frees the decoder's memory now; delete() afterwards frees the rest.
@@ -405,7 +423,7 @@ private:
     if (pixels.isNull()) {
       if (progress.complete) {
         m_more = false;
-        js_throw("No frames remain");
+        js_throw("No more frames");
       }
       js_throw("Need more data: push more before decoding again");
     }
@@ -460,6 +478,7 @@ EMSCRIPTEN_BINDINGS(imagedecoder) {
       .class_function("open", &ImageDecoder::open)
       .function("pushData", &ImageDecoder::pushData)
       .function("markComplete", &ImageDecoder::markComplete)
+      .function("rewind", &ImageDecoder::rewind)
       .function("decodeNext", &ImageDecoder::decodeNext)
       .function("getGainmap", &ImageDecoder::getGainmap)
       .function("listTags", &ImageDecoder::listTags)

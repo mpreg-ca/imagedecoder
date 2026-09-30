@@ -146,7 +146,8 @@ class ImageDecoder private constructor(
 
     /**
      * One decoded frame. A whole frame owns native pixels, outliving the decoder until [close].
-     * A [partial] one views the decoder's, valid until the next [decodeNext].
+     * A [partial] one views the decoder's, valid until the next [decodeNext] or [rewind], which
+     * close it.
      */
     class Frame private constructor(
         buffer: ByteBuffer,
@@ -220,11 +221,13 @@ class ImageDecoder private constructor(
     var page: Int = 0
         private set
 
+    /** False once a still's frame is out, or on an error; an animation always has another. */
     val hasNext: Boolean get() = more && !closed.get()
 
     /**
-     * Decodes forward to the next whole frame. If the pushed bytes run out first, returns the
-     * latest progressive step instead ([Frame.partial]), or throws [NeedMoreDataException]
+     * Decodes forward to the next whole frame, which after an animation's last is its first
+     * again, forever (the file's loop count aside). If the pushed bytes run out first, returns
+     * the latest progressive step instead ([Frame.partial]), or throws [NeedMoreDataException]
      * when there is nothing to show yet; call again after [pushData].
      *
      * Exif orientation is applied (a quarter turn swaps width and height). Output is sRGB
@@ -232,28 +235,89 @@ class ImageDecoder private constructor(
      *
      * @throws NeedMoreDataException if a streaming decode has nothing to show yet.
      * @throws OutOfMemoryException if the image does not fit in memory.
-     * @throws DecodeException if the file is malformed or truncated, no frames remain, or this
-     *     decoder is closed.
+     * @throws DecodeException if the file is malformed or truncated, a still has no more
+     *     frames, or this decoder is closed.
      */
     @Synchronized
     @Throws(DecodeException::class)
     fun decodeNext(): Frame {
         checkOpen()
-        if (!more) throw DecodeException("No frames remain")
+        if (!more) throw DecodeException("No more frames")
+        expirePartial()
         val f = try {
             nativeDecode()
         } catch (e: NeedMoreDataException) {
             throw e
         } catch (e: DecodeException) {
-            more = false // Decoder errors are final.
-            throw e
+            // Some formats find their end on a call with no frame left: that pass is over.
+            // A real error can't loop - the rewind repeats it.
+            if (page == 0 || !isAnimated) {
+                more = false // Decoder errors are final.
+                throw e
+            }
+            rewind()
+            try {
+                nativeDecode()
+            } catch (e2: DecodeException) {
+                more = false
+                throw e2
+            }
         }
-        if (f.last) more = false
+        if (f.last) {
+            if (!isAnimated) {
+                more = false
+            } else {
+                // Now: a whole frame owns its pixels, so the rewind can't touch this one.
+                try {
+                    rewind()
+                } catch (e: DecodeException) {
+                    // Ends here instead; the frame is still good.
+                }
+            }
+        }
         page = f.index
+        if (f.partial) lastPartial = f
         return f
     }
 
+    // The partial frame out, a view of what the next decode or rewind rewrites or frees.
+    private var lastPartial: Frame? = null
+
+    val isAnimated: Boolean
+        @Throws(DecodeException::class)
+        get() = pages > 1
+
+
+    /** Closed, so its [Frame.image] throws rather than reading memory the decoder reused. */
+    private fun expirePartial() {
+        lastPartial?.close()
+        lastPartial = null
+    }
+
     private external fun nativeDecode(): Frame
+
+    /**
+     * Back to frame 0 over the bytes already read, to replay an animation without reopening it.
+     *
+     * @throws DecodeException if the file isn't all in, an earlier decode failed, or this decoder
+     *     is closed. Rewinding failed leaves no frames.
+     */
+    @Synchronized
+    @Throws(DecodeException::class)
+    fun rewind() {
+        checkOpen()
+        expirePartial()
+        try {
+            nativeRewind()
+        } catch (e: DecodeException) {
+            more = false
+            throw e
+        }
+        more = true
+        page = 0
+    }
+
+    private external fun nativeRewind()
 
     /**
      * The gain map, oriented like the frames; null unless [HdrKind.GAINMAP], or if it is

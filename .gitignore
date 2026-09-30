@@ -10,3 +10,4 @@
 !/subprojects/packagefiles/
 /dist/
 /android/.idea
+/build-wasm

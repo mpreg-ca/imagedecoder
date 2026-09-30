@@ -380,6 +380,30 @@ std::vector<uint8_t> orient_copy(const uint8_t *src, size_t stride,
   return out;
 }
 
+void BaseDecoder::rewind() {
+  if (m_error) {
+    std::rethrow_exception(m_error);
+  }
+  if (!source_complete()) {
+    throw std::runtime_error("Rewinding needs the whole file");
+  }
+  try {
+    restart();
+    m_laid_out = false;
+    m_shown_valid = false;
+    m_frame = 0;
+    m_duration_ms = 0;
+    // Now, so what the header gives (frame count, HDR kind) holds throughout.
+    if (!read_header()) {
+      throw std::runtime_error("Image header no longer reads");
+    }
+  } catch (...) {
+    // A restart that threw leaves the codec half built; later calls repeat this.
+    m_error = std::current_exception();
+    throw;
+  }
+}
+
 DecodeProgress BaseDecoder::decode(const DecodeOptions &options) {
   if (m_error) {
     std::rethrow_exception(m_error);

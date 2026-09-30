@@ -487,7 +487,7 @@ Java_ca_mpreg_imagedecoder_ImageDecoder_nativeDecode(JNIEnv *env,
     // A Frame always has pixels: none yet means waiting, or no frame at all.
     if (!buffer) {
       if (progress.complete) {
-        fail(EXC_DECODE, "No frames remain");
+        fail(EXC_DECODE, "No more frames");
       }
       fail(EXC_NEED_DATA, "More data is needed before anything can be shown");
     }
@@ -871,6 +871,32 @@ Java_ca_mpreg_imagedecoder_ImageDecoder_nativeMarkComplete(JNIEnv *env,
     throw_decode_error(env, EXC_DECODE, e.what());
   } catch (...) {
     throw_decode_error(env, EXC_DECODE, "Image decode failed");
+  }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_ca_mpreg_imagedecoder_ImageDecoder_nativeRewind(JNIEnv *env,
+                                                     jobject self) {
+  try {
+    auto *handle = (DecoderHandle *)(intptr_t)ptr_of(env, self, CLS_DECODER);
+    if (env->ExceptionCheck()) {
+      return;
+    }
+    if (!handle || !handle->decoder) {
+      fail(EXC_DECODE, "ImageDecoder has been closed");
+    }
+    handle->decoder->rewind();
+    handle->partial.clear();
+  } catch (const DecodeError &e) {
+    if (e.cls) {
+      throw_decode_error(env, e.cls, e.msg.c_str());
+    }
+  } catch (const std::bad_alloc &) {
+    throw_decode_error(env, EXC_OOM, "Out of memory rewinding image");
+  } catch (const std::exception &e) {
+    throw_decode_error(env, EXC_DECODE, e.what());
+  } catch (...) {
+    throw_decode_error(env, EXC_DECODE, "Image rewind failed");
   }
 }
 

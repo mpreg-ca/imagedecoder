@@ -353,6 +353,10 @@ public:
   // Non-virtual: decode_impl decodes; this compacts, turns and reports.
   DecodeProgress decode(const DecodeOptions &options);
 
+  // Back to frame 0 over the bytes already held, to replay an animation. Needs
+  // the whole file. A throw here, or one earlier, leaves the decoder failed.
+  void rewind();
+
   const std::vector<uint8_t> &buffer() const { return m_buffer; }
 
   std::vector<uint8_t> take_buffer() { return std::move(m_buffer); }
