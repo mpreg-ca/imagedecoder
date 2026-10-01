@@ -212,6 +212,30 @@ void JpegXlDecoder::present(const DecodeOptions &opts) {
   finish_layout(m_buffer.data(), m_row_stride, info, opts, 0, h);
 }
 
+// JxlDecoderRewind keeps the decoder, runner, events and settings, and replays
+// the events from the top: the header's go by unread in decode_threaded.
+void JpegXlDecoder::rewind_codec() {
+  if (!m_dec) {
+    restart();
+    return;
+  }
+  if (m_attached) {
+    JxlDecoderReleaseInput(m_dec);
+  }
+  JxlDecoderRewind(m_dec);
+  // The input from the start again.
+  m_source.consumed = 0;
+  m_attached = false;
+  m_closed = false;
+  m_attached_end = 0;
+  m_complete = false;
+  m_frame_ready = false;
+  m_advance_frame = false;
+  m_last_frame = false;
+  // Reallocates m_raw, freed after the last frame.
+  m_row_stride = 0;
+}
+
 void JpegXlDecoder::restart() {
   close();
   m_basic = JxlBasicInfo{};

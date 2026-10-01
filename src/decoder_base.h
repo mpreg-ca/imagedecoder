@@ -387,6 +387,10 @@ public:
 protected:
   virtual void restart() = 0;
 
+  // Back to frame 0 for [rewind], the header kept. A codec with its own rewind
+  // keeps its state; the rest start over.
+  virtual void rewind_codec() { restart(); }
+
   void finish_layout(uint8_t *base, size_t stride, const ImageInfo &dec,
                      const DecodeOptions &opts, uint32_t y, uint32_t height);
 

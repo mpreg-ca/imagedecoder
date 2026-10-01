@@ -739,6 +739,21 @@ const GainmapData *AvifDecoder::gainmap() {
   return &m_gainmap;
 }
 
+// avifDecoderReset keeps the parse and IO: the next image is frame 0 again.
+void AvifDecoder::rewind_codec() {
+  if (!m_dec || !m_has_info) {
+    restart();
+    return;
+  }
+  const avifResult r = avifDecoderReset(m_dec);
+  if (r != AVIF_RESULT_OK) {
+    fail("Failed to rewind AVIF", r, m_dec);
+  }
+  m_complete = false;
+  m_advance_frame = false;
+  m_rows = 0;
+}
+
 void AvifDecoder::restart() {
   close();
   m_has_info = false;

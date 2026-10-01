@@ -88,6 +88,18 @@ BaseDecoder::StepResult WebpDecoder::decode_impl(const DecodeOptions &opts) {
   return m_animated ? decode_animation(opts) : decode_still(opts);
 }
 
+// WebPAnimDecoderReset keeps the demuxed animation: the next frame is 0 again.
+void WebpDecoder::rewind_codec() {
+  if (!m_anim) {
+    restart();
+    return;
+  }
+  WebPAnimDecoderReset(m_anim);
+  m_complete = false;
+  m_prev_timestamp = 0;
+  m_next_frame = 0;
+}
+
 void WebpDecoder::restart() {
   close();
   WebPInitDecoderConfig(&m_config);

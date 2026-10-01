@@ -388,7 +388,7 @@ void BaseDecoder::rewind() {
     throw std::runtime_error("Rewinding needs the whole file");
   }
   try {
-    restart();
+    rewind_codec();
     m_laid_out = false;
     m_shown_valid = false;
     m_frame = 0;

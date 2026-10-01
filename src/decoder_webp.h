@@ -29,6 +29,7 @@ public:
 
 protected:
   void restart() override;
+  void rewind_codec() override;
 
 private:
   void close();

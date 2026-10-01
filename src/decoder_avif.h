@@ -57,6 +57,7 @@ public:
 
 protected:
   void restart() override;
+  void rewind_codec() override;
 
 private:
   static avifResult read(avifIO *io, uint32_t flags, uint64_t offset,
