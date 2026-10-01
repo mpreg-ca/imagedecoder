@@ -81,24 +81,8 @@ jobs:
           version: ${{ env.EMSDK_VERSION }}
           actions-cache-folder: emsdk-cache
 
-      # The pins, plus the files holding the wasm build flags (which the pin
-      # hash ignores), plus the compiler: any of them changes the objects.
-      - name: Dependency pin hash
-        id: pins
-        run: echo "hash=$(sh tools/dep-pins.sh)" >> "$GITHUB_OUTPUT"
-
-      - name: Cache built dependencies
-        uses: actions/cache@v6
-        with:
-          # As above; here their caches also hold emsdk's per-run _temp path.
-          path: |
-            build-wasm/fakeroot
-            !build-wasm/fakeroot/src/ep_imagedecoder*
-          key: deps-v2-wasm-${{ matrix.threads }}-${{ env.EMSDK_VERSION }}-${{ steps.pins.outputs.hash }}-${{ hashFiles('CMakeLists.txt', 'cmake/**') }}
-
       # FETCH_PREBUILT_DEPS downloads the tarball published for these pins and
-      # this Emscripten; without one (pins just changed) it builds from source,
-      # which the cache above then keeps.
+      # this Emscripten; without one (pins just changed) it builds from source.
       - name: Build
         run: |
           emcmake cmake -S . -B build-wasm -G Ninja -DCMAKE_BUILD_TYPE=Release \
