@@ -43,6 +43,9 @@ public:
 
 protected:
   void restart() override;
+  InvalidRect begin_region(const InvalidRect &want) override;
+  uint32_t begin_scale(uint32_t sample, uint32_t aligned,
+                       const InvalidRect &want) override;
 
 private:
   void create();

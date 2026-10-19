@@ -389,6 +389,8 @@ void BaseDecoder::rewind() {
   }
   try {
     rewind_codec();
+    m_started = false;
+    m_region_done = false;
     m_laid_out = false;
     m_shown_valid = false;
     m_frame = 0;
@@ -398,7 +400,8 @@ void BaseDecoder::rewind() {
       throw std::runtime_error("Image header no longer reads");
     }
   } catch (...) {
-    // A restart that threw leaves the codec half built; later calls repeat this.
+    // A restart that threw leaves the codec half built; later calls repeat
+    // this.
     m_error = std::current_exception();
     throw;
   }
@@ -407,6 +410,9 @@ void BaseDecoder::rewind() {
 DecodeProgress BaseDecoder::decode(const DecodeOptions &options) {
   if (m_error) {
     std::rethrow_exception(m_error);
+  }
+  if (m_region_done) {
+    rewind();
   }
   try {
     if (!read_header()) {
@@ -434,6 +440,7 @@ DecodeProgress BaseDecoder::decode(const DecodeOptions &options) {
       }
     }
 
+    m_started = true;
     const StepResult r = decode_impl(opts);
     m_laid_out = true;
     m_layout_opts = opts;
@@ -487,8 +494,9 @@ DecodeProgress BaseDecoder::decode(const DecodeOptions &options) {
     const size_t stride = r.finished_stride;
     progress.stride = stride;
 
-    // Planar YUV is exact-sized and has no whole pixels to compact or turn.
-    if (can_expand_rgba(layout)) {
+    // Planar YUV is exact-sized and has no whole pixels to compact or turn;
+    // streamed rows already went to the sampler.
+    if (can_expand_rgba(layout) && !(m_sampler && m_sampler->streamed)) {
       const size_t out_stride = row_bytes(layout);
       const uint32_t h = layout.original_height;
       if (out_stride > stride ||
@@ -533,6 +541,523 @@ DecodeProgress BaseDecoder::decode(const DecodeOptions &options) {
     m_error = std::current_exception();
     throw;
   }
+}
+
+// Where stored pixel (x, y) lands once turned; as orient_copy places it.
+static void turn_point(uint32_t orientation, uint32_t w, uint32_t h, uint32_t x,
+                       uint32_t y, uint32_t *dx, uint32_t *dy) {
+  switch (orientation) {
+  case 2:
+    *dx = w - 1 - x;
+    *dy = y;
+    return;
+  case 3:
+    *dx = w - 1 - x;
+    *dy = h - 1 - y;
+    return;
+  case 4:
+    *dx = x;
+    *dy = h - 1 - y;
+    return;
+  case 5:
+    *dx = y;
+    *dy = x;
+    return;
+  case 6:
+    *dx = h - 1 - y;
+    *dy = x;
+    return;
+  case 7:
+    *dx = h - 1 - y;
+    *dy = w - 1 - x;
+    return;
+  case 8:
+    *dx = y;
+    *dy = w - 1 - x;
+    return;
+  default:
+    *dx = x;
+    *dy = y;
+    return;
+  }
+}
+
+InvalidRect turn_rect(const InvalidRect &r, uint32_t orientation, uint32_t w,
+                      uint32_t h) {
+  uint32_t x0, y0, x1, y1;
+  turn_point(orientation, w, h, r.x, r.y, &x0, &y0);
+  turn_point(orientation, w, h, r.x + r.width - 1, r.y + r.height - 1, &x1,
+             &y1);
+  const uint32_t left = std::min(x0, x1);
+  const uint32_t top = std::min(y0, y1);
+  return InvalidRect{left, top, std::max(x0, x1) - left + 1,
+                     std::max(y0, y1) - top + 1};
+}
+
+InvalidRect unturn_rect(const InvalidRect &r, uint32_t orientation, uint32_t w,
+                        uint32_t h) {
+  // 6 and 8 undo each other; every other orientation undoes itself.
+  const uint32_t inverse = orientation == 6   ? 8
+                           : orientation == 8 ? 6
+                                              : orientation;
+  const bool swap = orientation_swaps_axes(orientation);
+  return turn_rect(r, inverse, swap ? h : w, swap ? w : h);
+}
+
+DecodeProgress BaseDecoder::decode_region(const DecodeOptions &options,
+                                          const InvalidRect *rect,
+                                          uint32_t sample) {
+  DecodeProgress progress = decode_region_once(options, rect, sample);
+  // Frees the codec's working memory now: a viewer may hold the decoder idle
+  // long after. A failure is the next call's to report.
+  std::vector<uint8_t> result = std::move(m_buffer);
+  try {
+    rewind();
+  } catch (...) {
+  }
+  m_buffer = std::move(result);
+  return progress;
+}
+
+DecodeProgress BaseDecoder::decode_region_once(const DecodeOptions &options,
+                                               const InvalidRect *rect,
+                                               uint32_t sample) {
+  if (m_error) {
+    std::rethrow_exception(m_error);
+  }
+  if (!source_complete()) {
+    throw std::runtime_error("Region decoding needs the whole file");
+  }
+  if (m_started) {
+    rewind();
+  }
+  try {
+    if (!read_header()) {
+      throw std::runtime_error("Truncated image");
+    }
+  } catch (...) {
+    m_error = std::current_exception();
+    throw;
+  }
+
+  const ImageInfo full = info;
+  const uint32_t sw = full.original_width;
+  const uint32_t sh = full.original_height;
+  const uint32_t orientation = options.apply_orientation ? full.orientation : 1;
+  const bool swap = orientation_swaps_axes(orientation);
+  const uint32_t tw = swap ? sh : sw;
+  const uint32_t th = swap ? sw : sh;
+
+  InvalidRect want{0, 0, tw, th};
+  if (rect) {
+    if (rect->empty() || rect->x >= tw || rect->y >= th ||
+        rect->width > tw - rect->x || rect->height > th - rect->y) {
+      throw std::runtime_error("Region lies outside the image");
+    }
+    want = *rect;
+  }
+  if (sample > 1) {
+    return decode_sampled(options, want, sample);
+  }
+  const bool whole =
+      want.x == 0 && want.y == 0 && want.width == tw && want.height == th;
+
+  // What the codec makes, in stored coordinates: a superset of the request.
+  InvalidRect made{0, 0, sw, sh};
+  if (!whole) {
+    try {
+      const InvalidRect stored = unturn_rect(want, orientation, sw, sh);
+      made = begin_region(stored);
+      // The crop below relies on it: inside the image, around the request.
+      if (made.empty() || made.x > sw || made.width > sw - made.x ||
+          made.y > sh || made.height > sh - made.y || made.x > stored.x ||
+          made.y > stored.y || made.x + made.width < stored.x + stored.width ||
+          made.y + made.height < stored.y + stored.height) {
+        throw std::logic_error("Codec region does not cover the request");
+      }
+    } catch (...) {
+      m_error = std::current_exception();
+      throw;
+    }
+    // The codec lays out a made-sized image, so the turn and crop below do too.
+    info.original_width = made.width;
+    info.original_height = made.height;
+    info.width = made.width;
+    info.height = made.height;
+  }
+
+  DecodeProgress progress;
+  try {
+    for (;;) {
+      progress = decode(options);
+      if (progress.finished && progress.changed) {
+        break;
+      }
+      if (progress.complete || !progress.changed) {
+        throw std::runtime_error("Image has no frame to decode");
+      }
+    }
+  } catch (...) {
+    info = full;
+    m_region = InvalidRect{};
+    m_region_done = true;
+    throw;
+  }
+  info = full;
+  m_region = InvalidRect{};
+  m_region_done = true;
+  // buffer() no longer holds the whole frame decode() would report.
+  m_shown_valid = false;
+  m_laid_out = false;
+
+  if (whole) {
+    return progress;
+  }
+
+  // The request, relative to the made rect once both are turned.
+  const InvalidRect made_turned = turn_rect(made, orientation, sw, sh);
+  const InvalidRect crop{want.x - made_turned.x, want.y - made_turned.y,
+                         want.width, want.height};
+  progress.info.original_width = full.original_width;
+  progress.info.original_height = full.original_height;
+  if (crop.x == 0 && crop.y == 0 && crop.width == progress.info.width &&
+      crop.height == progress.info.height) {
+    return progress;
+  }
+  if (!can_expand_rgba(progress.info)) {
+    throw std::runtime_error("Planar output cannot be cropped");
+  }
+
+  try {
+    // In place: each cropped row lands at or before where it is read from.
+    const size_t pixel =
+        (size_t)progress.info.components * ((progress.info.bits + 7) / 8);
+    const size_t out_stride = (size_t)crop.width * pixel;
+    if (progress.info.width != made_turned.width ||
+        progress.info.height != made_turned.height ||
+        progress.stride < (size_t)progress.info.width * pixel ||
+        (uint64_t)m_buffer.size() <
+            (uint64_t)progress.stride * (crop.y + crop.height - 1) +
+                (uint64_t)(crop.x + crop.width) * pixel) {
+      throw std::logic_error("Region frame does not match its layout");
+    }
+    for (uint32_t y = 0; y < crop.height; y++) {
+      memmove(m_buffer.data() + out_stride * y,
+              m_buffer.data() + progress.stride * (crop.y + y) +
+                  (size_t)crop.x * pixel,
+              out_stride);
+    }
+    m_buffer.resize(out_stride * crop.height);
+    m_buffer.shrink_to_fit();
+
+    progress.info.width = crop.width;
+    progress.info.height = crop.height;
+    progress.stride = out_stride;
+    progress.rect = InvalidRect{0, 0, crop.width, crop.height};
+    return progress;
+  } catch (...) {
+    m_error = std::current_exception();
+    throw;
+  }
+}
+
+static uint32_t nearest(const RowSampler::Axis &a, uint32_t i) {
+  const int64_t block = (int64_t)a.start + (int64_t)i * a.k - a.phase;
+  const int64_t at = a.last ? block + a.k - 1 : block;
+  return (uint32_t)std::min<int64_t>(std::max<int64_t>(at, a.start), a.end - 1);
+}
+
+RowSampler::RowSampler(size_t pixel_bytes, Axis x, Axis y)
+    : m_pixel(pixel_bytes), m_x(x), m_y(y) {
+  if (x.out == 0 || y.out == 0 || x.k == 0 || y.k == 0 || x.start >= x.end ||
+      y.start >= y.end || pixel_bytes == 0) {
+    throw std::logic_error("Empty sampling");
+  }
+  m_cols.resize(x.out);
+  for (uint32_t i = 0; i < x.out; i++) {
+    m_cols[i] = nearest(x, i);
+  }
+  m_rows.resize(y.out);
+  for (uint32_t i = 0; i < y.out; i++) {
+    m_rows[i] = nearest(y, i);
+  }
+  m_out.assign(checked_buffer_bytes((size_t)x.out * pixel_bytes, y.out), 0);
+}
+
+void RowSampler::feed(const uint8_t *first, size_t stride, uint32_t y,
+                      uint32_t n) {
+  const size_t out_stride = (size_t)m_x.out * m_pixel;
+  for (uint32_t r = 0; r < n; r++, y++) {
+    if (y != m_next) {
+      throw std::logic_error("Sampled rows out of order");
+    }
+    m_next++;
+    if (y < m_y.start || y >= m_y.end) {
+      continue;
+    }
+    m_fed++;
+    const uint8_t *row = first + stride * r;
+    // Rows only increase, so output rows (clamped ones share) fill in order.
+    while (m_row < m_y.out && m_rows[m_row] == y) {
+      uint8_t *dst = m_out.data() + out_stride * m_row;
+      for (uint32_t i = 0; i < m_x.out; i++) {
+        memcpy(dst + (size_t)i * m_pixel, row + (size_t)m_cols[i] * m_pixel,
+               m_pixel);
+      }
+      m_row++;
+    }
+  }
+}
+
+std::vector<uint8_t> RowSampler::finish() {
+  if (m_row != m_y.out) {
+    throw std::runtime_error("Sampled region got too few rows");
+  }
+  return std::move(m_out);
+}
+
+void BaseDecoder::emit_rows(const uint8_t *first, size_t stride, uint32_t y,
+                            uint32_t n) {
+  if (!m_sampler) {
+    throw std::logic_error("Rows handed on outside a sampled decode");
+  }
+  m_sampler->streamed = true;
+  m_sampler->feed(first, stride, y, n);
+}
+
+void BaseDecoder::emit_frame(const uint8_t *src, size_t src_stride,
+                             const ImageInfo &dec, const DecodeOptions &opts,
+                             const SrgbTransform *srgb, uint32_t rows) {
+  const uint32_t band = 64;
+  const size_t stride = layout_stride(dec, opts);
+  const size_t row = row_bytes(dec);
+  if (row > src_stride) {
+    throw std::logic_error("Frame rows are wider than their stride");
+  }
+  m_buffer.resize(checked_buffer_bytes(stride, std::min(band, rows)));
+  for (uint32_t y = 0; y < rows; y += band) {
+    const uint32_t n = std::min(band, rows - y);
+    for (uint32_t r = 0; r < n; r++) {
+      memcpy(m_buffer.data() + stride * r, src + src_stride * (y + r), row);
+    }
+    if (srgb) {
+      srgb->apply(m_buffer.data(), stride, 0, n);
+    }
+    finish_layout(m_buffer.data(), stride, dec, opts, 0, n);
+    emit_rows(m_buffer.data(), stride, y, n);
+  }
+}
+
+static uint32_t div_ceil(uint32_t a, uint32_t b) {
+  return (uint32_t)(((uint64_t)a + b - 1) / b);
+}
+
+DecodeProgress BaseDecoder::decode_sampled(const DecodeOptions &options,
+                                           const InvalidRect &want,
+                                           uint32_t sample, bool native) {
+  const ImageInfo full = info;
+  const uint32_t sw = full.original_width;
+  const uint32_t sh = full.original_height;
+  const uint32_t orientation = options.apply_orientation &&
+                                       full.orientation >= 2 &&
+                                       full.orientation <= 8
+                                   ? full.orientation
+                                   : 1;
+
+  if (!expands_to_rgba(options.output_mode)) {
+    throw std::runtime_error("Sampling needs an Rgba output mode");
+  }
+  // Past the image's size every sample gives one pixel; capped there, all the
+  // block arithmetic below stays well inside 32 bits.
+  sample = std::min(sample, std::max(sw, sh));
+  const bool converted = full.color == ColorFamily::YUV;
+  if (!converted && !can_expand_rgba(full)) {
+    throw std::runtime_error("This image cannot be sampled");
+  }
+  const bool f16 = options.output_mode == OutputMode::RgbaF16;
+
+  // Decoded unturned; only the small result is turned.
+  DecodeOptions inner = options;
+  inner.apply_orientation = false;
+
+  const InvalidRect stored = unturn_rect(want, orientation, sw, sh);
+  // Where turning reverses a stored axis, its partial block goes first.
+  const bool rev_x = orientation == 2 || orientation == 3 || orientation == 7 ||
+                     orientation == 8;
+  const bool rev_y = orientation == 3 || orientation == 4 || orientation == 6 ||
+                     orientation == 7;
+
+  const uint32_t ow = div_ceil(stored.width, sample);
+  const uint32_t oh = div_ceil(stored.height, sample);
+  DecodeProgress progress;
+  InvalidRect made;
+  InvalidRect req;
+  std::vector<uint8_t> out;
+  uint32_t f = 1;
+  try {
+    // Blocks start where the turned region does: its far end on a reversed
+    // axis.
+    const uint32_t ax = rev_x ? stored.x + stored.width : stored.x;
+    const uint32_t ay = rev_y ? stored.y + stored.height : stored.y;
+    uint32_t aligned = sample & (~sample + 1);
+    while (aligned > 1 && (ax % aligned || ay % aligned)) {
+      aligned /= 2;
+    }
+    // The request widened to whole blocks, from where the turned region
+    // starts, and clipped to the image: what a codec scaling all the way by
+    // the sample makes, so each of its pixels is one block.
+    auto widen = [&](uint32_t pos, uint32_t len, uint32_t limit, bool rev,
+                     uint32_t *gpos, uint32_t *glen) {
+      const int64_t span = (int64_t)div_ceil(len, sample) * sample;
+      int64_t a = rev ? (int64_t)pos + len - span : (int64_t)pos;
+      int64_t b = a + span;
+      a = std::max<int64_t>(a, 0);
+      b = std::min<int64_t>(b, limit);
+      *gpos = (uint32_t)a;
+      *glen = (uint32_t)(b - a);
+    };
+    InvalidRect grid;
+    widen(stored.x, stored.width, sw, rev_x, &grid.x, &grid.width);
+    widen(stored.y, stored.height, sh, rev_y, &grid.y, &grid.height);
+
+    f = native ? begin_scale(sample, aligned, grid) : 1;
+    if (f == 0 || sample % f != 0) {
+      throw std::logic_error("Codec scale does not divide the sample");
+    }
+    req = f == sample ? grid : stored;
+    made = begin_region(req);
+    if (made.empty() || made.x > sw || made.width > sw - made.x ||
+        made.y > sh || made.height > sh - made.y || made.x > req.x ||
+        made.y > req.y || made.x + made.width < req.x + req.width ||
+        made.y + made.height < req.y + req.height) {
+      throw std::logic_error("Codec region does not cover the request");
+    }
+    const uint32_t cw = div_ceil(made.width, f);
+    const uint32_t ch = div_ceil(made.height, f);
+    info.original_width = cw;
+    info.original_height = ch;
+    info.width = cw;
+    info.height = ch;
+
+    // The request in the codec's (scaled) pixels, inside the made image.
+    auto axis = [&](uint32_t pos, uint32_t len, uint32_t mpos, uint32_t clen,
+                    bool rev, uint32_t want_len) {
+      RowSampler::Axis a;
+      a.start = std::min((pos - mpos) / f, clen - 1);
+      a.end =
+          std::max(std::min(div_ceil(pos + len - mpos, f), clen), a.start + 1);
+      a.k = sample / f;
+      a.out = div_ceil(want_len, sample);
+      const uint64_t span = (uint64_t)a.out * a.k;
+      a.phase = rev && span > a.end - a.start
+                    ? (uint32_t)(span - (a.end - a.start))
+                    : 0;
+      a.last = rev;
+      return a;
+    };
+    const RowSampler::Axis sx =
+        axis(req.x, req.width, made.x, cw, rev_x, stored.width);
+    const RowSampler::Axis sy =
+        axis(req.y, req.height, made.y, ch, rev_y, stored.height);
+    m_sampler = std::make_unique<RowSampler>(f16 ? 8 : 4, sx, sy);
+
+    for (;;) {
+      progress = decode(inner);
+      if (progress.finished && progress.changed) {
+        break;
+      }
+      if (progress.complete || !progress.changed) {
+        throw std::runtime_error("Image has no frame to decode");
+      }
+    }
+    if (!m_sampler->streamed) {
+      const ImageInfo &l = progress.info;
+      if (l.components != 4 || l.bits != (f16 ? 16u : 8u) || l.width != cw ||
+          l.height != ch ||
+          (uint64_t)m_buffer.size() < (uint64_t)progress.stride * ch) {
+        throw std::logic_error("Sampled frame does not match its layout");
+      }
+      m_sampler->feed(m_buffer.data(), progress.stride, 0, ch);
+    }
+    if (m_sampler->fed() != sy.end - sy.start) {
+      throw std::logic_error("Sampled frame is missing rows");
+    }
+    out = m_sampler->finish();
+    // The codec's buffers are done with before the turn copies the result.
+    m_sampler.reset();
+    std::vector<uint8_t>().swap(m_buffer);
+    if (orientation != 1) {
+      ImageInfo stored_layout = progress.info;
+      stored_layout.original_width = ow;
+      stored_layout.original_height = oh;
+      out = orient_copy(out.data(), (size_t)ow * (f16 ? 8 : 4), stored_layout,
+                        orientation);
+    }
+    return finish_sampled(progress, std::move(out), full, ow, oh, orientation);
+  } catch (const std::bad_alloc &) {
+    info = full;
+    m_region = InvalidRect{};
+    m_scale = 1;
+    m_sampler.reset();
+    m_region_done = true;
+    m_error = std::current_exception();
+    throw;
+  } catch (...) {
+    info = full;
+    m_region = InvalidRect{};
+    m_scale = 1;
+    m_sampler.reset();
+    m_region_done = true;
+    if (f <= 1) {
+      m_error = std::current_exception();
+      throw;
+    }
+    // A codec's own scaling can refuse what its plain decode takes (a JPEG
+    // 2000 tile with fewer levels than the header said): once more without.
+    m_error = nullptr;
+  }
+  rewind();
+  try {
+    if (!read_header()) {
+      throw std::runtime_error("Truncated image");
+    }
+  } catch (...) {
+    m_error = std::current_exception();
+    throw;
+  }
+  return decode_sampled(options, want, sample, false);
+}
+
+DecodeProgress BaseDecoder::finish_sampled(DecodeProgress progress,
+                                           std::vector<uint8_t> &&out,
+                                           const ImageInfo &full, uint32_t ow,
+                                           uint32_t oh, uint32_t orientation) {
+  info = full;
+  m_region = InvalidRect{};
+  m_scale = 1;
+  m_region_done = true;
+  m_shown_valid = false;
+  m_laid_out = false;
+
+  const bool f16 = progress.info.bits == 16;
+  ImageInfo layout = progress.info;
+  layout.original_width = ow;
+  layout.original_height = oh;
+  layout.width = ow;
+  layout.height = oh;
+  if (orientation_swaps_axes(orientation)) {
+    std::swap(layout.width, layout.height);
+  }
+  m_buffer = std::move(out);
+
+  progress.info = layout;
+  progress.info.original_width = full.original_width;
+  progress.info.original_height = full.original_height;
+  progress.stride = (size_t)layout.width * 4 * (f16 ? 2 : 1);
+  progress.rect = InvalidRect{0, 0, layout.width, layout.height};
+  progress.changed = true;
+  progress.finished = true;
+  return progress;
 }
 
 } // namespace imagedecoder

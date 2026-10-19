@@ -29,6 +29,9 @@ public:
 
 protected:
   void restart() override;
+  InvalidRect begin_region(const InvalidRect &want) override;
+  uint32_t begin_scale(uint32_t sample, uint32_t aligned,
+                       const InvalidRect &want) override;
   void rewind_codec() override;
 
 private:
@@ -43,6 +46,7 @@ private:
   WebPAnimDecoder *m_anim = nullptr;
 
   bool m_animated = false;
+  bool m_lossy = false;
   uint32_t m_frame_count = 1;
   uint32_t m_loop_count = 0;
   int m_prev_timestamp = 0;

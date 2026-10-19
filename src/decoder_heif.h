@@ -6,6 +6,7 @@
 
 #include <libheif/heif.h>
 #include <libheif/heif_sequences.h>
+#include <libheif/heif_tiling.h>
 
 namespace imagedecoder {
 
@@ -43,12 +44,24 @@ public:
 
 protected:
   void restart() override;
+  InvalidRect begin_region(const InvalidRect &want) override;
 
 private:
   void close();
   void read_metadata(heif_image_handle *handle);
   void copy_planes(heif_image *image, const ImageInfo &dec);
   void find_gainmap();
+  int copy_pixels(heif_image *image, const ImageInfo &dec, size_t work_stride,
+                  uint32_t dx, uint32_t dy, uint32_t sx, uint32_t sy,
+                  uint32_t w, uint32_t h);
+  // A tile row at a time to [band] (y within the region, rows) when given.
+  int decode_tiles(heif_colorspace space, heif_chroma chroma,
+                   const ImageInfo &dec, size_t work_stride,
+                   const std::function<void(uint32_t y, uint32_t rows,
+                                            int bits)> &band = nullptr);
+  void finish_rows(const ImageInfo &dec, const DecodeOptions &opts,
+                   size_t work_stride, int decoded_bits, uint32_t y,
+                   uint32_t rows);
 
   heif_context *m_ctx = nullptr;
   heif_image_handle *m_handle = nullptr;
@@ -60,6 +73,9 @@ private:
   uint32_t m_loop_count = 0;
   bool m_advance_frame = false;
   bool m_complete = false;
+  // A region decode assembling m_region from these tiles.
+  bool m_tiles = false;
+  heif_image_tiling m_tiling{};
 
   std::string m_name = "AVIF";
   HdrKind m_hdr_kind = HdrKind::None;
@@ -75,6 +91,8 @@ private:
   bool m_premultiplied = false;
 
   cmsHPROFILE m_src_profile = nullptr;
+  // finish_rows()'s, made on first use in each decode_impl().
+  std::unique_ptr<SrgbTransform> m_srgb_rows;
   std::vector<uint8_t> m_exif;
 };
 

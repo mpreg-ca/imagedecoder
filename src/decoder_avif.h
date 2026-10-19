@@ -58,6 +58,7 @@ public:
 protected:
   void restart() override;
   void rewind_codec() override;
+  InvalidRect begin_region(const InvalidRect &want) override;
 
 private:
   static avifResult read(avifIO *io, uint32_t flags, uint64_t offset,
@@ -67,6 +68,10 @@ private:
   void find_gainmap();
   bool matches_header(const avifImage *img) const;
   void convert(const ImageInfo &dec, size_t work_stride, uint32_t rows);
+  void convert_view(const ImageInfo &dec, const avifImage *src, uint8_t *dst,
+                    size_t stride, uint32_t rows);
+  void stream_rows(const ImageInfo &dec, const DecodeOptions &opts,
+                   size_t work_stride);
   void copy_planes(const ImageInfo &dec);
 
   avifDecoder *m_dec = nullptr;
@@ -90,6 +95,11 @@ private:
   bool m_cropped = false;
   uint32_t m_turn = 1;
   std::vector<uint8_t> m_native;
+  // Coded-image rects: what is converted (whole, or a region's, even where
+  // chroma is subsampled), and what of it is kept - the clap crop, or the
+  // region's made rect before its turn.
+  avifCropRect m_view = {};
+  avifCropRect m_take = {};
 
   HdrKind m_hdr_kind = HdrKind::None;
   float m_hdr_headroom = 0.0f;

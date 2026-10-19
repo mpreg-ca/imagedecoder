@@ -94,7 +94,10 @@ BaseDecoder::StepResult PngDecoder::decode_impl(const DecodeOptions &opts) {
   m_frame_ready = false;
 
   while (!m_done && !m_frame_ready && m_source.available() > 0) {
-    size_t chunk = m_source.available();
+    // A region stops at its last row; libpng inflates all it is handed first.
+    size_t chunk = m_region.empty()
+                       ? m_source.available()
+                       : std::min<size_t>(m_source.available(), 64 * 1024);
     const uint8_t *at = m_source.data() + m_source.consumed;
     m_source.consumed += chunk;
     png_process_data(m_png, m_pinfo, (png_bytep)at, chunk);
@@ -162,13 +165,16 @@ void PngDecoder::restart() {
   m_loop_count = 0;
   m_skip_frame = false;
   m_frame_x = m_frame_y = m_frame_w = m_frame_h = 0;
-  m_frame_buf.clear();
-  m_work.clear();
+  // Freed, not just emptied: a decoder may sit idle long after a restart.
+  std::vector<uint8_t>().swap(m_frame_buf);
+  std::vector<uint8_t>().swap(m_work);
   m_frame_ready = false;
   m_unconsumed = 0;
-  m_buffer.clear();
-  m_canvas.clear();
+  std::vector<uint8_t>().swap(m_buffer);
+  std::vector<uint8_t>().swap(m_canvas);
+  std::vector<uint8_t>().swap(m_saved_canvas);
   m_row_stride = 0;
+  m_stream = false;
   m_source.consumed = 0;
   create();
 }
@@ -527,11 +533,15 @@ void PngDecoder::on_info() {
 void PngDecoder::allocate() {
   const size_t stride = layout_stride(info, m_opts);
   const size_t row_bytes = png_get_rowbytes(m_png, m_pinfo);
-  if (row_bytes > stride) {
+  if (region_row_bytes() > stride) {
     png_error(m_png, "PNG row is larger than the decode buffer");
   }
 
-  const size_t bytes = checked_buffer_bytes(stride, info.original_height);
+  // Interlaced rows land in every pass, so only progressive ones stream.
+  m_stream = sampling_rows() && !m_animated && m_passes == 1;
+  const size_t bytes = checked_buffer_bytes(
+      stride, m_stream ? std::min(INVALIDATE_ROWS, info.original_height)
+                       : info.original_height);
   if (m_animated) {
     m_canvas.assign(bytes, 0);
   } else if (m_passes > 1) {
@@ -572,11 +582,21 @@ void PngDecoder::on_row(png_bytep row, uint32_t y, int pass) {
     return;
   }
 
-  if (y >= info.original_height) {
+  if (m_passes == 1) {
+    // Rows outside a region are inflated and unfiltered, then dropped.
+    if (y < m_region.y) {
+      return;
+    }
+    y -= m_region.y;
+  }
+  if (y >= info.original_height || m_done) {
     return;
   }
   const size_t bytes = png_get_rowbytes(m_png, m_pinfo);
-  uint8_t *dst = m_buffer.data() + m_row_stride * y;
+  // Bands start on multiples of INVALIDATE_ROWS, so a streamed one fills
+  // the buffer from its top.
+  uint8_t *dst =
+      m_buffer.data() + m_row_stride * (m_stream ? y % INVALIDATE_ROWS : y);
 
   if (m_passes > 1) {
     // Converted per row from the combined raw one, so every pass shows.
@@ -589,7 +609,8 @@ void PngDecoder::on_row(png_bytep row, uint32_t y, int pass) {
     return;
   }
 
-  memcpy(dst, row, bytes);
+  const size_t pixel = (size_t)m_channels * (m_bit_depth / 8);
+  memcpy(dst, row + (size_t)m_region.x * pixel, region_row_bytes());
   m_last_row = y + 1 == info.original_height;
 
   if (pass != m_current_pass) {
@@ -610,8 +631,34 @@ void PngDecoder::on_row(png_bytep row, uint32_t y, int pass) {
   const uint32_t first = m_band_first;
   const uint32_t height = m_band_last - first + 1;
   m_in_band = false;
-  finish_rows(first, height);
+  if (m_stream) {
+    const uint32_t slot = first % INVALIDATE_ROWS;
+    finish_rows(slot, height);
+    emit_rows(m_buffer.data() + m_row_stride * slot, m_row_stride, first,
+              height);
+  } else {
+    finish_rows(first, height);
+  }
   m_dirty.add(InvalidRect{0, first, info.original_width, height});
+
+  if (m_last_row && !m_region.empty()) {
+    // Nothing below the region is needed. Pausing mid-IDAT corrupts libpng's
+    // buffer count; decode_impl stops after this piece instead.
+    m_done = true;
+  }
+}
+
+size_t PngDecoder::region_row_bytes() const {
+  return (size_t)info.original_width * m_channels * (m_bit_depth / 8);
+}
+
+InvalidRect PngDecoder::begin_region(const InvalidRect &want) {
+  // Adam7 and APNG make the whole image; the base crops it.
+  if (m_animated || m_passes > 1) {
+    return BaseDecoder::begin_region(want);
+  }
+  m_region = want;
+  return m_region;
 }
 
 } // namespace imagedecoder

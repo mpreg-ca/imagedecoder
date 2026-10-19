@@ -45,6 +45,7 @@ public:
 protected:
   void restart() override;
   void rewind_codec() override;
+  InvalidRect begin_region(const InvalidRect &want) override;
 
 private:
   void create();
@@ -53,6 +54,8 @@ private:
   void read_basic_info();
   void read_colour();
   void present(const DecodeOptions &opts);
+  static void region_rows(void *opaque, size_t x, size_t y, size_t n,
+                          const void *pixels);
 
   ::JxlDecoder *m_dec = nullptr;
   void *m_runner = nullptr;

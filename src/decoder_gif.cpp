@@ -174,6 +174,13 @@ BaseDecoder::StepResult GifDecoder::decode_impl(const DecodeOptions &opts) {
   m_next_frame++;
 
   const size_t work_stride = layout_stride(info, opts);
+  if (sampling_rows()) {
+    // Only the first frame: the canvas is not needed again.
+    emit_frame(m_canvas.data(), m_canvas_stride, info, opts, nullptr,
+               info.original_height);
+    m_complete = true;
+    return {true, work_stride, {}};
+  }
   // Stale bytes only in row padding, which decode() compacts away.
   m_buffer.resize(checked_buffer_bytes(work_stride, info.original_height));
   if (work_stride == m_canvas_stride) {
@@ -192,6 +199,33 @@ BaseDecoder::StepResult GifDecoder::decode_impl(const DecodeOptions &opts) {
     m_complete = true;
   }
   return {last, work_stride, {}};
+}
+
+InvalidRect GifDecoder::begin_region(const InvalidRect &want) {
+  // DGifSlurp already paid for the LZW; only the region is composited.
+  m_region = want;
+  return m_region;
+}
+
+// The slurped rasters stay; only compositing starts over.
+void GifDecoder::rewind_codec() {
+  if (!m_has_info) {
+    restart();
+    return;
+  }
+  m_complete = false;
+  m_next_frame = 0;
+  m_prev_dispose = DISPOSAL_UNSPECIFIED;
+  m_prev_w = 0;
+  m_prev_h = 0;
+  m_have_saved_canvas = false;
+  std::vector<uint8_t>().swap(m_saved_canvas);
+  m_frame = 0;
+  m_duration_ms = 0;
+  // Freed, not just emptied: a decoder may sit idle long after a rewind.
+  std::vector<uint8_t>().swap(m_buffer);
+  std::vector<uint8_t>().swap(m_canvas);
+  m_canvas_stride = 0;
 }
 
 void GifDecoder::restart() {
@@ -275,31 +309,26 @@ void GifDecoder::compose_frame(uint32_t index) {
     throw std::runtime_error("GIF frame has no raster");
   }
 
-  uint32_t left = (uint32_t)std::max(0, desc.Left);
-  uint32_t top = (uint32_t)std::max(0, desc.Top);
-  uint32_t fw = (uint32_t)std::max(0, desc.Width);
-  uint32_t fh = (uint32_t)std::max(0, desc.Height);
+  const int64_t left = desc.Left;
+  const int64_t top = desc.Top;
+  const int64_t fw = std::max(0, desc.Width);
+  const int64_t fh = std::max(0, desc.Height);
 
-  const uint32_t clip_x = std::min(left, info.original_width);
-  const uint32_t clip_y = std::min(top, info.original_height);
-  const uint32_t clip_w = std::min(fw, info.original_width - clip_x);
-  const uint32_t clip_h = std::min(fh, info.original_height - clip_y);
+  // The canvas covers m_region (the whole image outside a region decode).
+  const int64_t rx = m_region.x;
+  const int64_t ry = m_region.y;
+  const int64_t x0 = std::max(left, rx);
+  const int64_t y0 = std::max(top, ry);
+  const int64_t x1 =
+      std::max(x0, std::min(left + fw, rx + info.original_width));
+  const int64_t y1 =
+      std::max(y0, std::min(top + fh, ry + info.original_height));
 
-  for (uint32_t y = 0; y < fh; y++) {
-    const GifByteType *src = image.RasterBits + (size_t)y * fw;
-
-    uint32_t cy = top + y;
-    if (cy >= info.original_height) {
-      continue;
-    }
-
-    for (uint32_t x = 0; x < fw; x++) {
-      uint32_t cx = left + x;
-      if (cx >= info.original_width) {
-        break;
-      }
-
-      int idx = src[x];
+  for (int64_t y = y0; y < y1; y++) {
+    const GifByteType *src = image.RasterBits + (y - top) * fw;
+    uint8_t *row = m_canvas.data() + m_canvas_stride * (size_t)(y - ry);
+    for (int64_t x = x0; x < x1; x++) {
+      int idx = src[x - left];
       if (idx == transparent) {
         continue;
       }
@@ -308,13 +337,18 @@ void GifDecoder::compose_frame(uint32_t index) {
       }
 
       const GifColorType &c = map->Colors[idx];
-      uint8_t *d = m_canvas.data() + m_canvas_stride * cy + (size_t)cx * 4;
+      uint8_t *d = row + (size_t)(x - rx) * 4;
       d[0] = c.Red;
       d[1] = c.Green;
       d[2] = c.Blue;
       d[3] = 255;
     }
   }
+
+  const uint32_t clip_x = (uint32_t)(x0 - rx);
+  const uint32_t clip_y = (uint32_t)(y0 - ry);
+  const uint32_t clip_w = (uint32_t)(x1 - x0);
+  const uint32_t clip_h = (uint32_t)(y1 - y0);
 
   m_duration_ms = delay_ms;
   m_prev_dispose = dispose;

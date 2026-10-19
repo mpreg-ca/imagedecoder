@@ -1,3 +1,4 @@
+#include <android/bitmap.h>
 #include <jni.h>
 
 #include <algorithm>
@@ -526,10 +527,186 @@ Java_ca_mpreg_imagedecoder_ImageDecoder_nativeDecode(JNIEnv *env,
   }
 }
 
+// The first frame, cropped to x/y/width/height unless width is 0.
+extern "C" JNIEXPORT jobject JNICALL
+Java_ca_mpreg_imagedecoder_ImageDecoder_nativeDecodeRegion(JNIEnv *env,
+                                                           jobject self, jint x,
+                                                           jint y, jint width,
+                                                           jint height,
+                                                           jint sample) {
+  try {
+    auto *handle = (DecoderHandle *)(intptr_t)ptr_of(env, self, CLS_DECODER);
+    if (env->ExceptionCheck()) {
+      return nullptr;
+    }
+    if (!handle || !handle->decoder) {
+      fail(EXC_DECODE, "ImageDecoder has been closed");
+    }
+    handle->partial.clear();
+
+    const DecodeOptions options = kotlin_options(handle->decoder.get());
+    const imagedecoder::InvalidRect region{(uint32_t)x, (uint32_t)y,
+                                           (uint32_t)width, (uint32_t)height};
+    const DecodeProgress progress = handle->decoder->decode_region(
+        options, width > 0 ? &region : nullptr, (uint32_t)std::max(sample, 1));
+    if (progress.info.components != 4) {
+      fail(EXC_DECODE, "Image has no RGBA layout");
+    }
+
+    std::unique_ptr<FramePixels> owned(new FramePixels());
+    owned->data = handle->decoder->take_buffer();
+    LocalRef<jobject> buffer(
+        env, native_buffer(env, owned->data.data(), owned->data.size()));
+
+    LocalRef<jclass> cls(env, find_class_checked(env, CLS_RESULT));
+    jmethodID ctor = get_method_checked(env, cls, "<init>",
+                                        "(Ljava/nio/ByteBuffer;JIIZZZIIIIII)V");
+    const uint32_t w = progress.info.width;
+    const uint32_t h = progress.info.height;
+    jobject obj = env->NewObject(cls, ctor, (jobject)buffer,
+                                 (jlong)(intptr_t)owned.get(), (jint)w, (jint)h,
+                                 (jboolean)JNI_TRUE, (jboolean)JNI_FALSE,
+                                 (jboolean)JNI_TRUE, (jint)0, (jint)0, (jint)w,
+                                 (jint)h, (jint)0, (jint)progress.duration_ms);
+    if (!obj || env->ExceptionCheck()) {
+      if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+      }
+      fail(EXC_DECODE, "Failed to construct Frame");
+    }
+    owned.release(); // The Frame frees it.
+
+    return obj;
+  } catch (const DecodeError &e) {
+    if (e.cls) {
+      throw_decode_error(env, e.cls, e.msg.c_str());
+    }
+    return nullptr;
+  } catch (const std::bad_alloc &) {
+    throw_decode_error(env, EXC_OOM, "Out of memory decoding image");
+    return nullptr;
+  } catch (const std::exception &e) {
+    throw_decode_error(env, EXC_DECODE, e.what());
+    return nullptr;
+  } catch (...) {
+    throw_decode_error(env, EXC_DECODE, "Image decode failed");
+    return nullptr;
+  }
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_ca_mpreg_imagedecoder_ImageDecoder_nativeFreePixels(JNIEnv *, jclass,
                                                          jlong pixels) {
   delete (FramePixels *)(intptr_t)pixels;
+}
+
+static float half_to_float(uint16_t h) {
+  const uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+  const uint32_t e = (h >> 10) & 0x1fu;
+  const uint32_t m = h & 0x3ffu;
+  float f;
+  if (e == 0) {
+    f = (float)m * (1.0f / 16777216.0f); // subnormal: m * 2^-24
+    return sign ? -f : f;
+  }
+  const uint32_t bits = sign | (e == 0x1f ? 0x7f800000u | (m << 13)
+                                          : ((e + 112) << 23) | (m << 13));
+  memcpy(&f, &bits, sizeof f);
+  return f;
+}
+
+/* Decodes into [bitmap]'s pixels, which Kotlin sized to the result: RGBA_8888
+ * for 8-bit output, RGBA_F16 for half-float. Premultiplied on the way in, as
+ * a Bitmap holds it. */
+extern "C" JNIEXPORT void JNICALL
+Java_ca_mpreg_imagedecoder_ImageDecoder_nativeDecodeBitmap(
+    JNIEnv *env, jobject self, jint x, jint y, jint width, jint height,
+    jint sample, jobject bitmap) {
+  void *pixels = nullptr;
+  try {
+    auto *handle = (DecoderHandle *)(intptr_t)ptr_of(env, self, CLS_DECODER);
+    if (env->ExceptionCheck()) {
+      return;
+    }
+    if (!handle || !handle->decoder) {
+      fail(EXC_DECODE, "ImageDecoder has been closed");
+    }
+    handle->partial.clear();
+
+    const DecodeOptions options = kotlin_options(handle->decoder.get());
+    const bool f16 = options.output_mode == imagedecoder::OutputMode::RgbaF16;
+    const imagedecoder::InvalidRect region{(uint32_t)x, (uint32_t)y,
+                                           (uint32_t)width, (uint32_t)height};
+    const DecodeProgress progress = handle->decoder->decode_region(
+        options, width > 0 ? &region : nullptr, (uint32_t)std::max(sample, 1));
+    // Not kept: the bitmap is the copy.
+    const std::vector<uint8_t> data = handle->decoder->take_buffer();
+    const uint32_t w = progress.info.width;
+    const uint32_t h = progress.info.height;
+    const size_t row = (size_t)w * (f16 ? 8 : 4);
+    if (progress.info.components != 4 || progress.stride != row ||
+        data.size() < row * h) {
+      fail(EXC_DECODE, "Image has no RGBA layout");
+    }
+
+    AndroidBitmapInfo bi;
+    if (AndroidBitmap_getInfo(env, bitmap, &bi) !=
+            ANDROID_BITMAP_RESULT_SUCCESS ||
+        bi.width != w || bi.height != h ||
+        bi.format != (f16 ? ANDROID_BITMAP_FORMAT_RGBA_F16
+                          : ANDROID_BITMAP_FORMAT_RGBA_8888) ||
+        bi.stride < row) {
+      fail(EXC_DECODE, "Bitmap does not match the decoded image");
+    }
+    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) !=
+            ANDROID_BITMAP_RESULT_SUCCESS ||
+        !pixels) {
+      pixels = nullptr;
+      fail(EXC_DECODE, "Failed to lock the bitmap");
+    }
+    const bool premul = (bi.flags & ANDROID_BITMAP_FLAGS_ALPHA_MASK) ==
+                        ANDROID_BITMAP_FLAGS_ALPHA_PREMUL;
+    for (uint32_t r = 0; r < h; r++) {
+      const uint8_t *src = data.data() + row * r;
+      uint8_t *dst = (uint8_t *)pixels + (size_t)bi.stride * r;
+      if (!premul) {
+        memcpy(dst, src, row);
+      } else if (f16) {
+        const uint16_t *s16 = (const uint16_t *)src;
+        uint16_t *d16 = (uint16_t *)dst;
+        for (uint32_t i = 0; i < w; i++) {
+          const float a = half_to_float(s16[i * 4 + 3]);
+          for (int c = 0; c < 3; c++) {
+            d16[i * 4 + c] = imagedecoder::hdr_float_to_half(
+                half_to_float(s16[i * 4 + c]) * a);
+          }
+          d16[i * 4 + 3] = s16[i * 4 + 3];
+        }
+      } else {
+        for (uint32_t i = 0; i < w; i++) {
+          const uint32_t a = src[i * 4 + 3];
+          for (int c = 0; c < 3; c++) {
+            dst[i * 4 + c] = (uint8_t)((src[i * 4 + c] * a + 127) / 255);
+          }
+          dst[i * 4 + 3] = (uint8_t)a;
+        }
+      }
+    }
+    AndroidBitmap_unlockPixels(env, bitmap);
+  } catch (const DecodeError &e) {
+    if (pixels) {
+      AndroidBitmap_unlockPixels(env, bitmap);
+    }
+    if (e.cls) {
+      throw_decode_error(env, e.cls, e.msg.c_str());
+    }
+  } catch (const std::bad_alloc &) {
+    throw_decode_error(env, EXC_OOM, "Out of memory decoding image");
+  } catch (const std::exception &e) {
+    throw_decode_error(env, EXC_DECODE, e.what());
+  } catch (...) {
+    throw_decode_error(env, EXC_DECODE, "Image decode failed");
+  }
 }
 
 extern "C" JNIEXPORT jint JNICALL

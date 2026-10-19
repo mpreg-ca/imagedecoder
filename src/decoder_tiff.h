@@ -34,15 +34,22 @@ public:
 
 protected:
   void restart() override;
+  InvalidRect begin_region(const InvalidRect &want) override;
 
 private:
   void close();
   bool open();
-  void read_native(const DecodeOptions &opts);
+  // A band at a time to `band` (rows y.. of the image, from m_buffer's top)
+  // when given; else the whole frame into m_buffer.
+  void read_native(
+      const DecodeOptions &opts,
+      const std::function<void(uint32_t y, uint32_t rows)> &band = nullptr);
   void read_rgba(const DecodeOptions &opts);
 
   TIFF *m_tiff = nullptr;
   size_t m_read_pos = 0;
+  uint32_t m_width = 0; // full image; info shrinks during a region
+  uint32_t m_height = 0;
 
   uint16_t m_bits_per_sample = 8;
   uint16_t m_samples_per_pixel = 1;

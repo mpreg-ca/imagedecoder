@@ -1,5 +1,7 @@
 package ca.mpreg.imagedecoder
 
+import android.graphics.Bitmap
+import android.graphics.Rect
 import java.io.Closeable
 import java.io.IOException
 import java.io.InputStream
@@ -242,6 +244,7 @@ class ImageDecoder private constructor(
     @Throws(DecodeException::class)
     fun decodeNext(): Frame {
         checkOpen()
+        if (regionDecoded) rewind()
         if (!more) throw DecodeException("No more frames")
         expirePartial()
         val f = try {
@@ -280,6 +283,97 @@ class ImageDecoder private constructor(
         return f
     }
 
+    // decode() left the codec past frame 0; decodeNext() starts over.
+    private var regionDecoded = false
+
+    /**
+     * Decodes the first frame (only, even of an animation), cropped to [region] in the
+     * oriented coordinates of [width] and [height], or whole when null, and shrunk by
+     * [sampleSize] to ceil(size / sampleSize). Can be called repeatedly on one decoder;
+     * [decodeNext] afterwards starts from frame 0 again.
+     *
+     * Shrinking happens while decoding, so the region never exists at full size where the
+     * format allows: JPEG, WebP and JPEG 2000 scale natively (filtered); the rest keep each
+     * block's top-left pixel.
+     *
+     * @throws IllegalArgumentException if [region] is empty or not inside the image, or
+     * [sampleSize] is below 1.
+     * @throws OutOfMemoryException if the image does not fit in memory.
+     * @throws DecodeException if the file isn't all in, is malformed, or this decoder is closed.
+     */
+    @JvmOverloads
+    @Synchronized
+    @Throws(DecodeException::class)
+    fun decode(region: Rect? = null, sampleSize: Int = 1): Frame {
+        val r = checkRegion(region, sampleSize)
+        val f = nativeDecodeRegion(r.left, r.top, r.width(), r.height(), sampleSize)
+        // Only once it worked: a refused call (say, bytes still arriving) moved nothing.
+        regionDecoded = true
+        return f
+    }
+
+    /**
+     * As [decode], straight into a new [Bitmap]: ARGB_8888, or RGBA_F16 when [isHdr].
+     * Premultiplied, as a Bitmap holds it, and with no [Frame] copy in between.
+     */
+    @JvmOverloads
+    @Synchronized
+    @Throws(DecodeException::class)
+    fun decodeToBitmap(region: Rect? = null, sampleSize: Int = 1): Bitmap {
+        val r = checkRegion(region, sampleSize)
+        // Long: a sampleSize near Int.MAX_VALUE overflows the round-up in Int.
+        val w = ((r.width().toLong() + sampleSize - 1) / sampleSize).toInt()
+        val h = ((r.height().toLong() + sampleSize - 1) / sampleSize).toInt()
+        val config = if (isHdr) Bitmap.Config.RGBA_F16 else Bitmap.Config.ARGB_8888
+        val bitmap = Bitmap.createBitmap(w, h, config)
+        try {
+            nativeDecodeBitmap(
+                if (region == null) 0 else r.left,
+                if (region == null) 0 else r.top,
+                if (region == null) 0 else r.width(),
+                if (region == null) 0 else r.height(),
+                sampleSize,
+                bitmap,
+            )
+        } catch (e: Throwable) {
+            bitmap.recycle()
+            throw e
+        }
+        regionDecoded = true
+        return bitmap
+    }
+
+    // Null means the whole image, passed to native as width 0.
+    private fun checkRegion(region: Rect?, sampleSize: Int): Rect {
+        checkOpen()
+        require(sampleSize >= 1) { "sampleSize $sampleSize is below 1" }
+        if (region != null) {
+            require(
+                !region.isEmpty && region.left >= 0 && region.top >= 0 &&
+                        region.right <= width && region.bottom <= height
+            ) { "region $region is not inside ${width}x$height" }
+        }
+        expirePartial()
+        return region ?: Rect(0, 0, width, height)
+    }
+
+    private external fun nativeDecodeRegion(
+        x: Int,
+        y: Int,
+        width: Int,
+        height: Int,
+        sample: Int,
+    ): Frame
+
+    private external fun nativeDecodeBitmap(
+        x: Int,
+        y: Int,
+        width: Int,
+        height: Int,
+        sample: Int,
+        bitmap: Bitmap,
+    )
+
     // The partial frame out, a view of what the next decode or rewind rewrites or frees.
     private var lastPartial: Frame? = null
 
@@ -315,6 +409,7 @@ class ImageDecoder private constructor(
         }
         more = true
         page = 0
+        regionDecoded = false
     }
 
     private external fun nativeRewind()

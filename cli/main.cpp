@@ -1,8 +1,9 @@
-
 #include "decoder_factory.h"
 #include "exif.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -71,6 +72,7 @@ static const char *family_name(ColorFamily c) {
 struct Args {
   DecodeOptions options;
   size_t chunk = 0;
+  uint32_t sample = 1;
   const char *out = nullptr;
   std::vector<const char *> files;
 };
@@ -102,6 +104,8 @@ static Args parse(int argc, char **argv, int from) {
       a.options.output_mode = OutputMode::Original;
     } else if (s == "--chunk") {
       a.chunk = (size_t)number(i, s);
+    } else if (s == "--sample") {
+      a.sample = (uint32_t)std::min<unsigned long long>(number(i, s), 1u << 20);
     } else if (s == "--out" && i + 1 < argc) {
       a.out = argv[++i];
     } else if (s == "--out") {
@@ -254,6 +258,18 @@ static int cmd_decode(const Args &a) {
       printf("%s: not a supported image\n", path);
       return 1;
     }
+    if (a.sample > 1) {
+      // The whole first frame, shrunk while it decodes.
+      dec->set_data(data.data(), data.size());
+      const DecodeProgress p = dec->decode_region(a.options, nullptr, a.sample);
+      printf("%s: %ux%u /%u, %zu bytes\n", path, p.info.width, p.info.height,
+             a.sample, dec->buffer().size());
+      if (a.out) {
+        write_file(a.out, dec->buffer().data(), dec->buffer().size());
+        printf("  wrote %s\n", a.out);
+      }
+      continue;
+    }
     Run r = decode_all(*dec, data, a.options, a.chunk);
 
     printf("%s: %ux%u %s %u x %u-bit %s, %zu bytes, %u steps, %u changes, "
@@ -270,6 +286,381 @@ static int cmd_decode(const Args &a) {
     }
   }
   return 0;
+}
+
+static float half_value(const uint8_t *p) {
+  uint16_t h;
+  memcpy(&h, p, 2);
+  const int e = (h >> 10) & 0x1f;
+  const int m = h & 0x3ff;
+  float v = e == 0    ? std::ldexp((float)m, -24)
+            : e == 31 ? 0.0f
+                      : std::ldexp((float)(m | 0x400), e - 25);
+  return h & 0x8000 ? -v : v;
+}
+
+// Sampled region decodes against the whole frame: exactly its nearest pixels
+// where the codec doesn't shrink natively, else near a box filter of it.
+static int cmd_region_sampled(const Args &a) {
+  using clock = std::chrono::steady_clock;
+  const uint32_t s = a.sample;
+  int bad = 0;
+  for (const char *path : a.files) {
+    auto data = read_file(path);
+    auto dec = create_decoder(data.data(), data.size());
+    if (!dec) {
+      printf("%s: not a supported image\n", path);
+      bad++;
+      continue;
+    }
+    dec->set_data(data.data(), data.size());
+    DecodeProgress p = dec->decode_region(a.options);
+    const std::vector<uint8_t> full = dec->buffer();
+    const uint32_t w = p.info.width;
+    const uint32_t h = p.info.height;
+    if (p.info.components != 4) {
+      printf("%s: not RGBA, skipped\n", path);
+      continue;
+    }
+    const bool f16 = p.info.bits == 16;
+    const size_t pixel = f16 ? 8 : 4;
+    auto value = [&](const uint8_t *px, int c) {
+      return f16 ? (double)half_value(px + c * 2) : (double)px[c];
+    };
+    printf("%s: %s %ux%u /%u\n", path, dec->get_name().c_str(), w, h, s);
+    // The whole image sampled: aligned regions must be exact crops of it.
+    const DecodeProgress wp = dec->decode_region(a.options, nullptr, s);
+    const std::vector<uint8_t> whole = dec->buffer();
+
+    std::vector<InvalidRect> rects = {
+        {0, 0, w, h},
+        {w / 3, h / 3, std::max(1u, w / 3), std::max(1u, h / 3)},
+        {w / 5 + 1, h / 7 + 3, std::max(1u, w / 2 - 3),
+         std::max(1u, h / 4 - 1)},
+        {w - 1, h - 1, 1, 1},
+    };
+    for (uint32_t i = 1; i <= 3; i++) {
+      const uint32_t x = w * i / 4 / s * s, y = h * i / 5 / s * s;
+      if ((w - x) / s && (h - y) / s) {
+        rects.push_back(
+            {x, y, (w - x) / s * s, std::min((h - y) / s, 7 * i + 1) * s});
+        rects.push_back({x / 2 / s * s, y,
+                         std::min((w - x / 2 / s * s) / s, 13u) * s,
+                         (h - y) / s * s});
+      }
+    }
+    uint32_t seed = 777;
+    auto rnd = [&](uint32_t n) {
+      seed = seed * 1103515245 + 12345;
+      return (seed >> 8) % n;
+    };
+    for (int i = 0; i < 5; i++) {
+      uint32_t x = rnd(w), y = rnd(h);
+      rects.push_back({x, y, 1 + rnd(w - x), 1 + rnd(h - y)});
+    }
+
+    for (const InvalidRect &r : rects) {
+      if (r.x + r.width > w || r.y + r.height > h || r.empty()) {
+        continue;
+      }
+      const auto t0 = clock::now();
+      DecodeProgress rp;
+      try {
+        rp = dec->decode_region(a.options, &r, s);
+      } catch (const std::exception &e) {
+        printf("  %5u,%-5u %5ux%-5u ERROR %s\n", r.x, r.y, r.width, r.height,
+               e.what());
+        bad++;
+        // A failed decoder stays failed; carry on with a fresh one.
+        dec = create_decoder(data.data(), data.size());
+        if (!dec) {
+          break;
+        }
+        dec->set_data(data.data(), data.size());
+        continue;
+      }
+      const double t =
+          std::chrono::duration<double, std::milli>(clock::now() - t0).count();
+      const std::vector<uint8_t> &got = dec->buffer();
+      const uint32_t ow = (r.width + s - 1) / s;
+      const uint32_t oh = (r.height + s - 1) / s;
+      const bool shape = rp.info.width == ow && rp.info.height == oh &&
+                         rp.stride == ow * pixel &&
+                         got.size() == rp.stride * oh;
+      // Edge blocks either stop at the region's edge, or (where the codec
+      // scales natively) run on a whole block past it, from wherever the
+      // region starts once turned: either passes.
+      // Or, where libwebp scales a region whose size isn't whole blocks, each
+      // pixel spread evenly over it (as a viewer would stretch the result).
+      auto compare = [&](int mode, double *sum_out, double *worst_out) {
+        const bool whole_blocks = mode == 1;
+        double sum = 0, worst = 0;
+        if (shape) {
+          for (uint32_t oy = 0; oy < oh; oy++) {
+            for (uint32_t ox = 0; ox < ow; ox++) {
+              int64_t bx = (int64_t)r.x + (int64_t)ox * s;
+              int64_t by = (int64_t)r.y + (int64_t)oy * s;
+              int64_t ex = std::min<int64_t>(bx + s, r.x + r.width);
+              int64_t ey = std::min<int64_t>(by + s, r.y + r.height);
+              if (whole_blocks) {
+                ex = std::min<int64_t>(bx + s, w);
+                ey = std::min<int64_t>(by + s, h);
+              } else if (mode == 2) {
+                bx = r.x + (int64_t)ox * r.width / ow;
+                by = r.y + (int64_t)oy * r.height / oh;
+                ex = std::max(bx + 1, r.x + ((int64_t)ox + 1) * r.width / ow);
+                ey = std::max(by + 1, r.y + ((int64_t)oy + 1) * r.height / oh);
+              }
+              const uint32_t x0 = (uint32_t)bx, y0 = (uint32_t)by;
+              const uint32_t x1 = (uint32_t)ex, y1 = (uint32_t)ey;
+              double acc[4] = {0, 0, 0, 0};
+              for (uint32_t y = y0; y < y1; y++) {
+                for (uint32_t x = x0; x < x1; x++) {
+                  const uint8_t *px = full.data() + p.stride * y + x * pixel;
+                  const double al = value(px, 3);
+                  for (int c = 0; c < 3; c++) {
+                    acc[c] += value(px, c) * al;
+                  }
+                  acc[3] += al;
+                }
+              }
+              const double n = (double)(x1 - x0) * (y1 - y0);
+              const uint8_t *g = got.data() + rp.stride * oy + ox * pixel;
+              for (int c = 0; c < 4; c++) {
+                const double want =
+                    c == 3 ? acc[3] / n : (acc[3] > 0 ? acc[c] / acc[3] : 0);
+                // Colour under no alpha is anything.
+                if (c < 3 && acc[3] == 0) {
+                  continue;
+                }
+                const double d = std::fabs(value(g, c) - want);
+                sum += d;
+                worst = std::max(worst, d);
+              }
+            }
+          }
+        }
+        *sum_out = sum;
+        *worst_out = worst;
+      };
+      // Each block's first pixel, once turned, exactly.
+      bool exact = shape;
+      for (uint32_t oy = 0; oy < oh && exact; oy++) {
+        exact = memcmp(got.data() + rp.stride * oy,
+                       full.data() + p.stride * (r.y + oy * s), 0) == 0;
+        for (uint32_t ox = 0; ox < ow && exact; ox++) {
+          exact = memcmp(got.data() + rp.stride * oy + ox * pixel,
+                         full.data() + p.stride * (r.y + oy * s) +
+                             (size_t)(r.x + ox * s) * pixel,
+                         pixel) == 0;
+        }
+      }
+      double sum, worst;
+      compare(0, &sum, &worst);
+      for (int mode = 1; mode <= 2; mode++) {
+        double sum2, worst2;
+        compare(mode, &sum2, &worst2);
+        if (sum2 < sum) {
+          sum = sum2;
+          worst = worst2;
+        }
+      }
+      // A region on the sample's grid. (Not one ending off it at the edge:
+      // libwebp stretches such a region's few pixels over its last block.)
+      // libwebp spreads a whole image's partial last block over the row, so
+      // there only images of whole blocks have crops to match. Its rescaler
+      // runs through premultiplied alpha, so it is compared premultiplied, a
+      // few steps either way passing. Lossy WebP scales its YUV planes before
+      // converting them, which shifts with the crop, so it isn't checked.
+      bool crop_ok = true;
+      const bool webp = dec->get_name() == "WEBP";
+      const bool lossy_webp =
+          webp && data.size() >= 16 &&
+          std::string(data.begin() + 12, data.begin() + 16) != "VP8L" &&
+          !(data.size() > 30 && memcmp(data.data() + 12, "VP8X", 4) == 0 &&
+            std::search(data.begin(), data.end(), "VP8L", "VP8L" + 4) !=
+                data.end());
+      const bool on_grid = r.x % s == 0 && r.y % s == 0 && r.width % s == 0 &&
+                           r.height % s == 0 && !(webp && (w % s || h % s)) &&
+                           !lossy_webp;
+      if (shape && on_grid) {
+        for (uint32_t oy = 0; oy < oh && crop_ok; oy++) {
+          const uint8_t *g = got.data() + rp.stride * oy;
+          const uint8_t *c = whole.data() + wp.stride * (r.y / s + oy) +
+                             (size_t)(r.x / s) * pixel;
+          for (size_t k = 0; k < rp.stride && crop_ok; k++) {
+            if (!webp) {
+              crop_ok = g[k] == c[k];
+              continue;
+            }
+            const size_t a0 = k / pixel * pixel;
+            const double ga = value(g + a0, 3), ca = value(c + a0, 3);
+            const int ch = (int)(k % pixel) / (f16 ? 2 : 1);
+            const double scale = f16 ? 1.0 : 255.0;
+            const double gv = ch == 3 ? ga : value(g + a0, ch) * ga / scale;
+            const double cv = ch == 3 ? ca : value(c + a0, ch) * ca / scale;
+            crop_ok = std::fabs(gv - cv) <= (f16 ? 3.0 / 255 : 3.0);
+          }
+        }
+      }
+      const double mean = shape ? sum / ((double)ow * oh * 4) : 0;
+      // Native shrinking (JPEG's scaled IDCT, libwebp's), perhaps with the
+      // nearest pixels of that after, is neither, so only gross misses fail;
+      // exactness is the crop check's. A JPEG 2000 resolution level is the
+      // wavelet's low band, sharper than any box, so there the crop check
+      // alone holds.
+      const double scale = f16 ? 1.0 / 255 : 1.0;
+      const bool ok =
+          shape && crop_ok &&
+          (exact || mean <= 32.0 * scale || dec->get_name() == "JP2");
+      printf("  %5u,%-5u %5ux%-5u -> %ux%u %8.1f ms  %s%s", r.x, r.y, r.width,
+             r.height, ow, oh, t,
+             !shape     ? "BAD SHAPE"
+             : !crop_ok ? "NOT A CROP"
+             : exact    ? "nearest"
+             : ok       ? "ok"
+                        : "DIFFERS",
+             on_grid && crop_ok && shape ? " =crop" : "");
+      if (shape) {
+        printf(" (mean %.3f max %.3f)", mean / scale, worst / scale);
+      }
+      printf("\n");
+      if (!ok) {
+        bad++;
+      }
+    }
+
+    if (!dec) {
+      continue;
+    }
+    // Plain decoding after a sampled region starts over, whole-sized.
+    DecodeProgress after;
+    do {
+      after = dec->decode(a.options);
+    } while (after.changed && !after.finished && !after.complete);
+    const DecodeProgress again = dec->decode_region(a.options);
+    const bool restarted = after.finished && after.frame == 0 &&
+                           again.finished && dec->buffer() == full;
+    printf("  decode() after sampled region: %s\n",
+           restarted ? "identical" : "WRONG");
+    if (!restarted) {
+      bad++;
+    }
+  }
+  return bad ? 1 : 0;
+}
+
+// Region decodes, on one reused decoder, must match crops of the whole frame.
+static int cmd_region(const Args &a) {
+  if (a.sample > 1) {
+    return cmd_region_sampled(a);
+  }
+  using clock = std::chrono::steady_clock;
+  auto ms = [](clock::time_point t0) {
+    return std::chrono::duration<double, std::milli>(clock::now() - t0).count();
+  };
+  int bad = 0;
+  for (const char *path : a.files) {
+    auto data = read_file(path);
+    auto dec = create_decoder(data.data(), data.size());
+    if (!dec) {
+      printf("%s: not a supported image\n", path);
+      bad++;
+      continue;
+    }
+    dec->set_data(data.data(), data.size());
+
+    auto t0 = clock::now();
+    DecodeProgress p = dec->decode_region(a.options);
+    const double full_ms = ms(t0);
+    const std::vector<uint8_t> full = dec->buffer();
+    const size_t full_stride = p.stride;
+    const uint32_t w = p.info.width;
+    const uint32_t h = p.info.height;
+    if (!can_expand_rgba(p.info)) {
+      printf("%s: planar output, skipped\n", path);
+      continue;
+    }
+    const size_t pixel = (size_t)p.info.components * ((p.info.bits + 7) / 8);
+    printf("%s: %s %ux%u full %.1f ms\n", path, dec->get_name().c_str(), w, h,
+           full_ms);
+
+    std::vector<InvalidRect> rects = {
+        {0, 0, w, h},
+        {0, 0, 1, 1},
+        {w - 1, h - 1, 1, 1},
+        {w / 3, h / 3, std::max(1u, w / 3), std::max(1u, h / 3)},
+        {w / 2, 0, w - w / 2, std::max(1u, h / 5)},
+        {0, h / 2, std::max(1u, w / 7), h - h / 2},
+        {w / 5 + 1, h / 7 + 3, std::max(1u, w / 2 - 3),
+         std::max(1u, h / 4 - 1)},
+        {0, h - std::max(1u, h / 9), w, std::max(1u, h / 9)},
+    };
+    uint32_t seed = 12345;
+    auto rnd = [&](uint32_t n) {
+      seed = seed * 1103515245 + 12345;
+      return (seed >> 8) % n;
+    };
+    for (int i = 0; i < 8; i++) {
+      uint32_t x = rnd(w), y = rnd(h);
+      rects.push_back({x, y, 1 + rnd(w - x), 1 + rnd(h - y)});
+    }
+
+    for (const InvalidRect &r : rects) {
+      if (r.x + r.width > w || r.y + r.height > h || r.empty()) {
+        continue;
+      }
+      t0 = clock::now();
+      DecodeProgress rp = dec->decode_region(a.options, &r);
+      const double t = ms(t0);
+      const std::vector<uint8_t> &got = dec->buffer();
+      int maxdiff = 0;
+      size_t ndiff = 0;
+      bool shape = rp.info.width == r.width && rp.info.height == r.height &&
+                   rp.stride == r.width * pixel &&
+                   got.size() == rp.stride * r.height;
+      if (shape) {
+        for (uint32_t y = 0; y < r.height; y++) {
+          const uint8_t *g = got.data() + rp.stride * y;
+          const uint8_t *f =
+              full.data() + full_stride * (r.y + y) + r.x * pixel;
+          for (size_t k = 0; k < r.width * pixel; k++) {
+            int d = std::abs((int)g[k] - (int)f[k]);
+            if (d) {
+              ndiff++;
+              maxdiff = std::max(maxdiff, d);
+            }
+          }
+        }
+      }
+      const bool ok = shape && maxdiff == 0;
+      printf("  %5u,%-5u %5ux%-5u %8.1f ms  %s", r.x, r.y, r.width, r.height, t,
+             !shape ? "BAD SHAPE"
+             : ok   ? "identical"
+                    : "DIFFERS");
+      if (shape && !ok) {
+        printf(" (%zu bytes, max %d)", ndiff, maxdiff);
+      }
+      printf("\n");
+      if (!ok) {
+        bad++;
+      }
+    }
+
+    // Plain decoding after a region starts over at frame 0, whole-sized.
+    DecodeProgress after;
+    do {
+      after = dec->decode(a.options);
+    } while (after.changed && !after.finished && !after.complete);
+    const bool restarted =
+        after.finished && after.frame == 0 && dec->buffer() == full;
+    printf("  decode() after region: %s\n",
+           restarted ? "frame 0, identical" : "WRONG");
+    if (!restarted) {
+      bad++;
+    }
+  }
+  return bad ? 1 : 0;
 }
 
 // Piecewise decode must produce the same bytes as whole-file decode.
@@ -364,6 +755,7 @@ static void usage() {
       "  tags      every Exif/TIFF tag and its value\n"
       "  decode    decode and report what came back\n"
       "  stream    check that piecewise decoding matches whole-file\n"
+      "  region    check that region decodes match crops of the whole\n"
       "  frames    per-frame durations and hashes of an animation\n"
       "  gainmap   the gain map's shape and metadata; --out writes its pixels\n"
       "  formats   the formats this build understands\n"
@@ -375,6 +767,9 @@ static void usage() {
       "  --original        keep a YUV JPEG or AVIF as planar subsampled YUV\n"
       "  --orient          turn the picture per the Exif Orientation tag\n"
       "  --chunk N         feed the file N bytes at a time\n"
+      "  --sample N        decode: the first frame shrunk N times as it\n"
+      "                    decodes; region: each region so, checked\n"
+      "                    against a box filter of the whole frame\n"
       "  --out FILE        write the decoded pixels\n");
 }
 
@@ -409,6 +804,9 @@ int main(int argc, char **argv) {
     }
     if (cmd == "decode") {
       return cmd_decode(a);
+    }
+    if (cmd == "region") {
+      return cmd_region(a);
     }
     if (cmd == "stream") {
       return cmd_stream(a);

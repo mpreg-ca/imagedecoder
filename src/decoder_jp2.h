@@ -33,12 +33,20 @@ public:
 
 protected:
   void restart() override;
+  InvalidRect begin_region(const InvalidRect &want) override;
+  uint32_t begin_scale(uint32_t sample, uint32_t aligned,
+                       const InvalidRect &want) override;
 
 private:
   void close();
   bool open();
+  void decode_data();
 
   opj_image_t *m_image = nullptr;
+  // Held from header to decode, so a region can be set between them.
+  opj_codec_t *m_codec = nullptr;
+  opj_stream_t *m_stream = nullptr;
+  uint32_t m_comp_x0 = 0, m_comp_y0 = 0; // Full image's, in component pixels.
   bool m_complete = false;
 
   size_t m_read_pos = 0;

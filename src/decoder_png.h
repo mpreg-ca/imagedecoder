@@ -29,6 +29,7 @@ public:
 
 protected:
   void restart() override;
+  InvalidRect begin_region(const InvalidRect &want) override;
 
 private:
   void create();
@@ -49,6 +50,8 @@ private:
   void allocate();
   void finish_rows(uint32_t y, uint32_t height);
   void on_row(png_bytep row, uint32_t y, int pass);
+  // Bytes of one row of the made rect (the whole row outside a region).
+  size_t region_row_bytes() const;
 
   png_struct *m_png = nullptr;
   png_info *m_pinfo = nullptr;
@@ -77,6 +80,8 @@ private:
   uint32_t m_band_first = 0;
   uint32_t m_band_last = 0;
   bool m_in_band = false;
+  // Sampled: m_buffer holds one band, handed on as it finishes.
+  bool m_stream = false;
   int m_current_pass = 0;
 
   bool m_done = false;

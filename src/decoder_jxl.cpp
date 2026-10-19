@@ -82,7 +82,12 @@ JpegXlDecoder::decode_threaded(const DecodeOptions &opts) {
     m_raw.assign(checked_buffer_bytes(row_bytes(info), info.original_height),
                  0);
     m_srgb = SrgbTransform(info, m_src_profile, opts.srgb_output);
-    m_buffer.assign(bytes, 0);
+    // Sampled, present() hands m_raw on a band at a time instead.
+    if (sampling_rows()) {
+      m_buffer.clear();
+    } else {
+      m_buffer.assign(bytes, 0);
+    }
     m_row_stride = stride;
   }
 
@@ -97,6 +102,14 @@ JpegXlDecoder::decode_threaded(const DecodeOptions &opts) {
     JxlDecoderStatus status = JxlDecoderProcessInput(m_dec);
 
     if (status == JXL_DEC_NEED_IMAGE_OUT_BUFFER) {
+      // A region keeps only its rows' spans; libjxl still decodes it all.
+      if (m_region.width > 0) {
+        if (JxlDecoderSetImageOutCallback(m_dec, &format, region_rows, this) !=
+            JXL_DEC_SUCCESS) {
+          throw std::runtime_error("Failed to set JXL output callback");
+        }
+        continue;
+      }
       if (JxlDecoderSetImageOutBuffer(m_dec, &format, m_raw.data(),
                                       m_raw.size()) != JXL_DEC_SUCCESS) {
         throw std::runtime_error("Failed to set JXL output buffer");
@@ -127,6 +140,10 @@ JpegXlDecoder::decode_threaded(const DecodeOptions &opts) {
     }
 
     if (status == JXL_DEC_FRAME_PROGRESSION) {
+      // A region wants the final frame only.
+      if (m_region.width > 0) {
+        continue;
+      }
       if (JxlDecoderFlushImage(m_dec) != JXL_DEC_SUCCESS) {
         continue;
       }
@@ -198,6 +215,10 @@ JpegXlDecoder::decode_threaded(const DecodeOptions &opts) {
 void JpegXlDecoder::present(const DecodeOptions &opts) {
   const size_t raw_stride = row_bytes(info);
   const uint32_t h = info.original_height;
+  if (sampling_rows()) {
+    emit_frame(m_raw.data(), raw_stride, info, opts, &m_srgb, h);
+    return;
+  }
   // decode() compacts or turns a finished frame, so it is laid out again.
   m_buffer.resize(m_row_stride * h);
   if (raw_stride == m_row_stride) {
@@ -210,6 +231,31 @@ void JpegXlDecoder::present(const DecodeOptions &opts) {
   }
   m_srgb.apply(m_buffer.data(), m_row_stride, 0, h);
   finish_layout(m_buffer.data(), m_row_stride, info, opts, 0, h);
+}
+
+InvalidRect JpegXlDecoder::begin_region(const InvalidRect &want) {
+  // Stored is what libjxl reports: already oriented, as xsize/ysize are.
+  m_region = want;
+  return m_region;
+}
+
+// May run on several threads at once, for disjoint spans.
+void JpegXlDecoder::region_rows(void *opaque, size_t x, size_t y, size_t n,
+                                const void *pixels) {
+  auto *self = static_cast<JpegXlDecoder *>(opaque);
+  const InvalidRect &r = self->m_region;
+  if (y < r.y || y >= (size_t)r.y + r.height) {
+    return;
+  }
+  const size_t x0 = std::max<size_t>(x, r.x);
+  const size_t x1 = std::min<size_t>(x + n, (size_t)r.x + r.width);
+  if (x0 >= x1) {
+    return;
+  }
+  const size_t px = (size_t)self->info.components * (self->info.bits / 8);
+  memcpy(self->m_raw.data() + row_bytes(self->info) * (y - r.y) +
+             (x0 - r.x) * px,
+         static_cast<const uint8_t *>(pixels) + (x0 - x) * px, (x1 - x0) * px);
 }
 
 // JxlDecoderRewind keeps the decoder, runner, events and settings, and replays
@@ -232,8 +278,10 @@ void JpegXlDecoder::rewind_codec() {
   m_frame_ready = false;
   m_advance_frame = false;
   m_last_frame = false;
-  // Reallocates m_raw, freed after the last frame.
+  // Reallocates m_raw; freed now, as a decoder may sit idle after a rewind.
   m_row_stride = 0;
+  std::vector<uint8_t>().swap(m_raw);
+  std::vector<uint8_t>().swap(m_buffer);
 }
 
 void JpegXlDecoder::restart() {
@@ -370,6 +418,11 @@ void JpegXlDecoder::read_basic_info() {
       .sample_type = SampleType::Integer,
       .bits = bits,
   };
+  // A threaded retry rereads the header mid-region: keep the made size.
+  if (m_region.width > 0) {
+    info.width = info.original_width = m_region.width;
+    info.height = info.original_height = m_region.height;
+  }
   m_has_info = true;
 }
 

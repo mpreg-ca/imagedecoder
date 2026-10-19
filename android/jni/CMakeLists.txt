@@ -47,6 +47,7 @@ target_link_libraries(imagedecoder_jni
     ${IMAGEDECODER_CORE}
     ${IMAGEDECODER_LINK_LIBS}
 
+    jnigraphics
     log
     m
     -static-libgcc

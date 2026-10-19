@@ -167,6 +167,8 @@ bool AvifDecoder::read_header() {
     std::swap(width, height);
   }
   check_dimensions(width, height);
+  m_view = {0, 0, m_coded_width, m_coded_height};
+  m_take = m_cropped ? m_crop : m_view;
   if (m_frame_count > 1 &&
       (uint64_t)m_frame_count * m_coded_width * m_coded_height >
           MAX_ANIMATION_PIXELS) {
@@ -260,8 +262,9 @@ BaseDecoder::StepResult AvifDecoder::decode_impl(const DecodeOptions &opts) {
   m_io.sizeHint = m_source.complete() ? m_source.size() : STREAMING_SIZE_HINT;
   avifResult r = avifDecoderNextImage(m_dec);
   // An earlier progressive layer may be coded smaller: skipped, not shown.
+  // Sampled, only the last layer is wanted, as earlier ones aren't shown.
   while (r == AVIF_RESULT_OK && m_progressive &&
-         !matches_header(m_dec->image) &&
+         (!matches_header(m_dec->image) || sampling_rows()) &&
          m_dec->imageIndex + 1 < m_dec->imageCount) {
     r = avifDecoderNextImage(m_dec);
   }
@@ -294,9 +297,22 @@ BaseDecoder::StepResult AvifDecoder::decode_impl(const DecodeOptions &opts) {
   }
   if (r != AVIF_RESULT_OK && m_threads > 1 && !m_emitted) {
     // Once, from the top, on one thread; a real error recurs there.
+    // A region's rects outlive it: info is laid out for them.
     const int threads = 1;
+    const avifCropRect view = m_view, take = m_take;
+    const ImageInfo laid = info;
+    const bool region = !m_region.empty();
     restart();
     m_threads = threads;
+    if (!read_header()) {
+      throw std::runtime_error("Truncated AVIF");
+    }
+    if (region) {
+      m_view = view;
+      m_take = take;
+      info.width = info.original_width = laid.original_width;
+      info.height = info.original_height = laid.original_height;
+    }
     return decode_impl(opts);
   }
   if (r != AVIF_RESULT_OK) {
@@ -316,7 +332,14 @@ BaseDecoder::StepResult AvifDecoder::decode_impl(const DecodeOptions &opts) {
   }
 
   if (planar) {
+    if (m_view.width != m_coded_width || m_view.height != m_coded_height) {
+      throw std::runtime_error("Planar output cannot be cropped");
+    }
     copy_planes(dec);
+  } else if (sampling_rows() && m_turn == 1 && m_take.x == m_view.x &&
+             m_take.y == m_view.y && m_take.width == m_view.width &&
+             m_take.height == m_view.height) {
+    stream_rows(dec, opts, work_stride);
   } else {
     convert(dec, work_stride, dec.original_height);
     if (opts.srgb_output) {
@@ -375,21 +398,40 @@ bool AvifDecoder::matches_header(const avifImage *img) const {
   return true;
 }
 
-// The top [rows] of the current image into m_buffer as dec lays it out:
-// straight in, or at native size first when it has to be cropped and turned
-// (whole images only). The image already matches the header.
+// The top [rows] of the current image into m_buffer as dec lays it out: the
+// view straight in, or at its own size first when it has to be cropped and
+// turned (whole views only). The image already matches the header.
 void AvifDecoder::convert(const ImageInfo &dec, size_t work_stride,
                           uint32_t rows) {
   const avifImage *img = m_dec->image;
-  const bool direct = !m_cropped && m_turn == 1;
-  // [rows] counts the image's own rows; a crop or turn needs all of them.
-  if (!direct) {
-    rows = img->height;
+  const bool direct = m_turn == 1 && m_take.x == m_view.x &&
+                      m_take.y == m_view.y && m_take.width == m_view.width &&
+                      m_take.height == m_view.height;
+  // [rows] counts the image's own rows; a crop, turn or region needs all.
+  const bool whole = m_view.width == img->width && m_view.height == img->height;
+  if (!direct || !whole) {
+    rows = m_view.height;
   }
 
+  // Only the view's rows: the rest of the planes stay unread.
+  struct View {
+    avifImage *img = avifImageCreateEmpty();
+    ~View() {
+      if (img) {
+        avifImageDestroy(img);
+      }
+    }
+  } view;
+  const avifCropRect rect = {m_view.x, m_view.y, m_view.width, rows};
+  if (!view.img ||
+      avifImageSetViewRect(view.img, img, &rect) != AVIF_RESULT_OK) {
+    throw std::runtime_error("Failed to view AVIF rows");
+  }
+  const avifImage *src = view.img;
+
   ImageInfo native = dec;
-  native.width = native.original_width = img->width;
-  native.height = native.original_height = img->height;
+  native.width = native.original_width = m_view.width;
+  native.height = native.original_height = m_view.height;
   const size_t native_stride = direct ? work_stride : row_bytes(native);
   uint8_t *dst;
   if (direct) {
@@ -397,10 +439,47 @@ void AvifDecoder::convert(const ImageInfo &dec, size_t work_stride,
     m_buffer.resize(checked_buffer_bytes(work_stride, dec.original_height));
     dst = m_buffer.data();
   } else {
-    m_native.resize(checked_buffer_bytes(native_stride, img->height));
+    m_native.resize(checked_buffer_bytes(native_stride, m_view.height));
     dst = m_native.data();
   }
 
+  convert_view(dec, src, dst, native_stride, rows);
+
+  if (direct) {
+    return;
+  }
+  ImageInfo kept = native;
+  kept.width = kept.original_width = m_take.width;
+  kept.height = kept.original_height = m_take.height;
+  const size_t bpp = (size_t)dec.components * (dec.bits / 8);
+  const uint8_t *from = m_native.data() +
+                        native_stride * (m_take.y - m_view.y) +
+                        bpp * (m_take.x - m_view.x);
+  const size_t row = row_bytes(dec);
+  m_buffer.resize(checked_buffer_bytes(work_stride, dec.original_height));
+  if (m_turn == 1) {
+    if (row_bytes(kept) < row || m_take.height < dec.original_height) {
+      throw std::runtime_error("AVIF crop produced too little");
+    }
+    for (uint32_t y = 0; y < dec.original_height; y++) {
+      memcpy(m_buffer.data() + work_stride * y, from + native_stride * y, row);
+    }
+    return;
+  }
+  const std::vector<uint8_t> turned =
+      orient_copy(from, native_stride, kept, m_turn);
+  if (turned.size() < row * dec.original_height) {
+    throw std::runtime_error("AVIF turn produced too little");
+  }
+  for (uint32_t y = 0; y < dec.original_height; y++) {
+    memcpy(m_buffer.data() + work_stride * y, turned.data() + row * y, row);
+  }
+}
+
+// The top [rows] of [src] (a view) into [dst] as dec lays out pixels.
+void AvifDecoder::convert_view(const ImageInfo &dec, const avifImage *src,
+                               uint8_t *dst, size_t native_stride,
+                               uint32_t rows) {
   if (m_mono) {
     // Luma as stored, like libheif's monochrome; alpha interleaved after it,
     // opaque if this frame has none.
@@ -408,13 +487,13 @@ void AvifDecoder::convert(const ImageInfo &dec, size_t work_stride,
     const size_t n = dec.components;
     const uint32_t opaque = wide ? 65535u : 255u;
     for (uint32_t y = 0; y < rows; y++) {
-      const uint8_t *ys = img->yuvPlanes[AVIF_CHAN_Y] +
-                          (size_t)img->yuvRowBytes[AVIF_CHAN_Y] * y;
-      const uint8_t *as = dec.has_alpha && img->alphaPlane
-                              ? img->alphaPlane + (size_t)img->alphaRowBytes * y
+      const uint8_t *ys = src->yuvPlanes[AVIF_CHAN_Y] +
+                          (size_t)src->yuvRowBytes[AVIF_CHAN_Y] * y;
+      const uint8_t *as = dec.has_alpha && src->alphaPlane
+                              ? src->alphaPlane + (size_t)src->alphaRowBytes * y
                               : nullptr;
       uint8_t *row = dst + native_stride * y;
-      for (uint32_t x = 0; x < img->width; x++) {
+      for (uint32_t x = 0; x < src->width; x++) {
         if (wide) {
           uint16_t *p = (uint16_t *)row + (size_t)x * n;
           p[0] = ((const uint16_t *)ys)[x];
@@ -431,13 +510,13 @@ void AvifDecoder::convert(const ImageInfo &dec, size_t work_stride,
       }
       if (wide) {
         // Opaque was already full scale; widening leaves it there.
-        widen((uint16_t *)row, (size_t)img->width * n, img->depth);
+        widen((uint16_t *)row, (size_t)src->width * n, src->depth);
       }
     }
-    if (img->alphaPremultiplied && dec.has_alpha && img->alphaPlane) {
+    if (src->alphaPremultiplied && dec.has_alpha && src->alphaPlane) {
       for (uint32_t y = 0; y < rows; y++) {
         uint8_t *row = dst + native_stride * y;
-        for (uint32_t x = 0; x < img->width; x++) {
+        for (uint32_t x = 0; x < src->width; x++) {
           const uint32_t a =
               wide ? ((uint16_t *)row)[x * 2 + 1] : row[x * 2 + 1];
           if (a == 0 || a >= opaque) {
@@ -454,24 +533,6 @@ void AvifDecoder::convert(const ImageInfo &dec, size_t work_stride,
       }
     }
   } else {
-    // Only the decoded rows: a view keeps the rest of the planes unread.
-    struct View {
-      avifImage *img = avifImageCreateEmpty();
-      ~View() {
-        if (img) {
-          avifImageDestroy(img);
-        }
-      }
-    } view;
-    const avifImage *src = img;
-    if (rows < img->height) {
-      const avifCropRect top = {0, 0, img->width, rows};
-      if (!view.img ||
-          avifImageSetViewRect(view.img, img, &top) != AVIF_RESULT_OK) {
-        throw std::runtime_error("Failed to view AVIF rows");
-      }
-      src = view.img;
-    }
     avifRGBImage rgb;
     avifRGBImageSetDefaults(&rgb, src);
     rgb.format = dec.has_alpha ? AVIF_RGB_FORMAT_RGBA : AVIF_RGB_FORMAT_RGB;
@@ -486,27 +547,58 @@ void AvifDecoder::convert(const ImageInfo &dec, size_t work_stride,
       fail("Failed to convert AVIF", r, nullptr);
     }
   }
+}
 
-  if (direct) {
-    return;
+/* Sampled: the view converted a band at a time and handed on, so no
+ * view-sized RGB frame is made. Each band converts with a margin, which
+ * chroma upsampling reads across, so its rows come out as whole-view ones. */
+void AvifDecoder::stream_rows(const ImageInfo &dec, const DecodeOptions &opts,
+                              size_t work_stride) {
+  const avifImage *img = m_dec->image;
+  const uint32_t band = 64;
+  const bool sub = m_format == AVIF_PIXEL_FORMAT_YUV420 ||
+                   m_format == AVIF_PIXEL_FORMAT_YUV422;
+  const bool sub_v = m_format == AVIF_PIXEL_FORMAT_YUV420;
+  const uint32_t margin = sub ? 4 : 0;
+  const SrgbTransform srgb(dec, m_src_profile, opts.srgb_output);
+  if (row_bytes(dec) > work_stride ||
+      (uint64_t)m_view.y + dec.original_height > img->height) {
+    throw std::runtime_error("AVIF view does not match its image");
   }
-  ImageInfo cropped = native;
-  const size_t bpp = (size_t)dec.components * (dec.bits / 8);
-  const uint8_t *src = m_native.data();
-  if (m_cropped) {
-    cropped.width = cropped.original_width = m_crop.width;
-    cropped.height = cropped.original_height = m_crop.height;
-    src += native_stride * m_crop.y + bpp * m_crop.x;
-  }
-  const std::vector<uint8_t> turned =
-      orient_copy(src, native_stride, cropped, m_turn);
-  const size_t row = row_bytes(dec);
-  if (turned.size() < row * dec.original_height) {
-    throw std::runtime_error("AVIF turn produced too little");
-  }
-  m_buffer.resize(checked_buffer_bytes(work_stride, dec.original_height));
-  for (uint32_t y = 0; y < dec.original_height; y++) {
-    memcpy(m_buffer.data() + work_stride * y, turned.data() + row * y, row);
+
+  struct View {
+    avifImage *img = avifImageCreateEmpty();
+    ~View() {
+      if (img) {
+        avifImageDestroy(img);
+      }
+    }
+  };
+  for (uint32_t y0 = 0; y0 < dec.original_height; y0 += band) {
+    const uint32_t y1 = std::min(y0 + band, dec.original_height);
+    // In the image's rows; a 4:2:0 view starts on an even one.
+    uint32_t a = m_view.y + y0 >= margin ? m_view.y + y0 - margin : 0;
+    uint32_t b = std::min<uint32_t>(m_view.y + y1 + margin, img->height);
+    if (sub_v) {
+      a &= ~1u;
+    }
+    const avifCropRect rect = {m_view.x, a, m_view.width, b - a};
+    View view;
+    if (!view.img ||
+        avifImageSetViewRect(view.img, img, &rect) != AVIF_RESULT_OK) {
+      throw std::runtime_error("Failed to view AVIF rows");
+    }
+    ImageInfo native = dec;
+    native.width = native.original_width = m_view.width;
+    native.height = native.original_height = b - a;
+    const size_t stride = std::max(work_stride, row_bytes(native));
+    m_buffer.resize(checked_buffer_bytes(stride, b - a));
+    convert_view(dec, view.img, m_buffer.data(), stride, b - a);
+    const uint32_t first = m_view.y + y0 - a;
+    const uint32_t n = y1 - y0;
+    srgb.apply(m_buffer.data(), stride, first, n);
+    finish_layout(m_buffer.data(), stride, dec, opts, first, n);
+    emit_rows(m_buffer.data() + stride * first, stride, y0, n);
   }
 }
 
@@ -740,8 +832,9 @@ const GainmapData *AvifDecoder::gainmap() {
 }
 
 // avifDecoderReset keeps the parse and IO: the next image is frame 0 again.
+// Not for layers: after it the last layer comes out wrong.
 void AvifDecoder::rewind_codec() {
-  if (!m_dec || !m_has_info) {
+  if (!m_dec || !m_has_info || m_progressive) {
     restart();
     return;
   }
@@ -752,6 +845,41 @@ void AvifDecoder::rewind_codec() {
   m_complete = false;
   m_advance_frame = false;
   m_rows = 0;
+  // Freed, not just emptied: a decoder may sit idle long after a rewind.
+  std::vector<uint8_t>().swap(m_native);
+  std::vector<uint8_t>().swap(m_buffer);
+  m_view = {0, 0, m_coded_width, m_coded_height};
+  m_take = m_cropped ? m_crop : m_view;
+}
+
+// The made rect: the request unturned onto the coded image, widened by a
+// margin where chroma is upsampled (so edge pixels filter as in a whole
+// decode), and the view to even coordinates for subsampled chroma.
+InvalidRect AvifDecoder::begin_region(const InvalidRect &want) {
+  const uint32_t cw = m_cropped ? m_crop.width : m_coded_width;
+  const uint32_t ch = m_cropped ? m_crop.height : m_coded_height;
+  const InvalidRect u = unturn_rect(want, m_turn, cw, ch);
+  const uint32_t ox = m_cropped ? m_crop.x : 0;
+  const uint32_t oy = m_cropped ? m_crop.y : 0;
+  const bool sub_x = m_format == AVIF_PIXEL_FORMAT_YUV420 ||
+                     m_format == AVIF_PIXEL_FORMAT_YUV422;
+  const bool sub_y = m_format == AVIF_PIXEL_FORMAT_YUV420;
+  const uint32_t mx = sub_x ? 4 : 0;
+  const uint32_t my = sub_y ? 4 : 0;
+  // Kept: within the clap crop.
+  const uint32_t tx0 = ox + (u.x > mx ? u.x - mx : 0);
+  const uint32_t ty0 = oy + (u.y > my ? u.y - my : 0);
+  const uint32_t tx1 = ox + std::min(cw, u.x + u.width + mx);
+  const uint32_t ty1 = oy + std::min(ch, u.y + u.height + my);
+  m_take = {tx0, ty0, tx1 - tx0, ty1 - ty0};
+  // Converted: the kept rect on even coordinates.
+  const uint32_t vx0 = sub_x ? tx0 & ~1u : tx0;
+  const uint32_t vy0 = sub_y ? ty0 & ~1u : ty0;
+  m_view = {vx0, vy0, tx1 - vx0, ty1 - vy0};
+
+  m_region = turn_rect(InvalidRect{tx0 - ox, ty0 - oy, tx1 - tx0, ty1 - ty0},
+                       m_turn, cw, ch);
+  return m_region;
 }
 
 void AvifDecoder::restart() {

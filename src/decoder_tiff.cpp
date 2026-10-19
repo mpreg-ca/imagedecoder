@@ -49,6 +49,8 @@ bool TiffDecoder::read_header() {
     throw std::runtime_error("TIFF has no image dimensions");
   }
   check_dimensions(width, height);
+  m_width = width;
+  m_height = height;
 
   TIFFGetFieldDefaulted(m_tiff, TIFFTAG_BITSPERSAMPLE, &m_bits_per_sample);
   TIFFGetFieldDefaulted(m_tiff, TIFFTAG_SAMPLESPERPIXEL, &m_samples_per_pixel);
@@ -152,13 +154,24 @@ BaseDecoder::StepResult TiffDecoder::decode_impl(const DecodeOptions &opts) {
 
   const ImageInfo &dec = info;
 
+  const size_t stride = layout_stride(dec, opts);
+  if (m_native_layout && sampling_rows()) {
+    // A band (a tile row, or some strips' rows) at a time, handed on.
+    const SrgbTransform srgb(dec, m_src_profile, opts.srgb_output);
+    read_native(opts, [&](uint32_t y, uint32_t rows) {
+      srgb.apply(m_buffer.data(), stride, 0, rows);
+      finish_layout(m_buffer.data(), stride, dec, opts, 0, rows);
+      emit_rows(m_buffer.data(), stride, y, rows);
+    });
+    m_complete = true;
+    return {true, stride, {}};
+  }
+
   if (m_native_layout) {
     read_native(opts);
   } else {
     read_rgba(opts);
   }
-
-  const size_t stride = layout_stride(dec, opts);
 
   if (opts.srgb_output) {
     SrgbTransform(dec, m_src_profile, true)
@@ -169,6 +182,27 @@ BaseDecoder::StepResult TiffDecoder::decode_impl(const DecodeOptions &opts) {
 
   m_complete = true;
   return {true, stride, {}};
+}
+
+InvalidRect TiffDecoder::begin_region(const InvalidRect &want) {
+  m_region = want;
+  if (m_native_layout && !TIFFIsTiled(m_tiff)) {
+    // Scanlines: whole rows from the first strip touched.
+    uint32_t rps = 0;
+    TIFFGetFieldDefaulted(m_tiff, TIFFTAG_ROWSPERSTRIP, &rps);
+    rps = std::max<uint32_t>(1, std::min(rps, m_height));
+    const uint32_t y0 = want.y / rps * rps;
+    m_region = InvalidRect{0, y0, m_width, want.y + want.height - y0};
+    return m_region;
+  }
+  uint16_t planar = PLANARCONFIG_CONTIG;
+  TIFFGetFieldDefaulted(m_tiff, TIFFTAG_PLANARCONFIG, &planar);
+  if (!m_native_layout && planar == PLANARCONFIG_SEPARATE) {
+    // libtiff's separate-plane RGBA readers step col_offset by whole pixels
+    // within one plane, so only rows are offset.
+    m_region = InvalidRect{0, want.y, m_width, want.height};
+  }
+  return m_region;
 }
 
 void TiffDecoder::restart() {
@@ -252,17 +286,35 @@ bool TiffDecoder::open() {
   return m_tiff != nullptr;
 }
 
-void TiffDecoder::read_native(const DecodeOptions &opts) {
+void TiffDecoder::read_native(
+    const DecodeOptions &opts,
+    const std::function<void(uint32_t, uint32_t)> &band) {
   const ImageInfo dec = info;
   const size_t src_stride = row_bytes(dec);
 
+  const size_t pixel = src_stride / dec.original_width;
   const tmsize_t scanline = TIFFScanlineSize(m_tiff);
-  if (scanline <= 0 || (size_t)scanline > src_stride) {
+  if (scanline <= 0 || (size_t)scanline > pixel * m_width) {
     throw std::runtime_error("TIFF scanline does not match its header");
   }
 
   const size_t row_stride = layout_stride(dec, opts);
-  m_buffer.assign(checked_buffer_bytes(row_stride, info.original_height), 0);
+  // Rows of the band in m_buffer, unpremultiplied, to `band` if given.
+  auto finish = [&](uint32_t y, uint32_t rows) {
+    uint8_t *first = m_buffer.data() + (band ? 0 : row_stride * y);
+    if (m_associated_alpha && dec.has_alpha) {
+      if (dec.bits == 16) {
+        unpremultiply<uint16_t>(first, row_stride, dec.original_width, rows,
+                                dec.components);
+      } else {
+        unpremultiply<uint8_t>(first, row_stride, dec.original_width, rows,
+                               dec.components);
+      }
+    }
+    if (band) {
+      band(y, rows);
+    }
+  };
 
   if (TIFFIsTiled(m_tiff)) {
     // Not through TIFFReadRGBAImage: it premultiplies unassociated alpha to
@@ -273,42 +325,79 @@ void TiffDecoder::read_native(const DecodeOptions &opts) {
     TIFFGetField(m_tiff, TIFFTAG_TILELENGTH, &th);
     const tmsize_t tile_bytes = TIFFTileSize(m_tiff);
     const tmsize_t tile_row = TIFFTileRowSize(m_tiff);
-    const size_t pixel = src_stride / dec.original_width;
+    const bool region = m_region.width != 0;
+    const uint32_t x0 = region ? m_region.x : 0;
+    const uint32_t y0 = region ? m_region.y : 0;
+    const uint32_t x1 = x0 + dec.original_width;
+    const uint32_t y1 = y0 + dec.original_height;
     if (tw == 0 || th == 0 || tile_bytes <= 0 || tile_row <= 0 ||
         (size_t)tile_row < (size_t)tw * pixel ||
         (uint64_t)tile_bytes < (uint64_t)tile_row * th) {
       throw std::runtime_error("TIFF tiles do not match its header");
     }
-    std::vector<uint8_t> tile((size_t)tile_bytes);
-    for (uint32_t ty = 0; ty < info.original_height; ty += th) {
-      for (uint32_t tx = 0; tx < info.original_width; tx += tw) {
-        if (TIFFReadTile(m_tiff, tile.data(), tx, ty, 0, 0) < 0) {
+    // Tiles may overhang the image, but not by more than a tile's worth.
+    if ((uint64_t)tw > (uint64_t)m_width + 16 * 1024 ||
+        (uint64_t)th > (uint64_t)m_height + 16 * 1024) {
+      throw std::runtime_error("TIFF tiles are larger than the image");
+    }
+    std::vector<uint8_t> tile(checked_buffer_bytes((size_t)tile_bytes, 1));
+    m_buffer.assign(
+        checked_buffer_bytes(row_stride,
+                             band ? std::min<uint64_t>(th, info.original_height)
+                                  : info.original_height),
+        0);
+    // Only tiles meeting [x0,x1)x[y0,y1), copying their overlap.
+    for (uint64_t ty = y0 / th * th; ty < y1; ty += th) {
+      // The buffer's first row: the band's top, or the region's.
+      const uint64_t top = band ? std::max<uint64_t>(ty, y0) : y0;
+      for (uint64_t tx = x0 / tw * tw; tx < x1; tx += tw) {
+        if (TIFFReadTile(m_tiff, tile.data(), (uint32_t)tx, (uint32_t)ty, 0,
+                         0) < 0) {
           throw std::runtime_error("Truncated or corrupt TIFF");
         }
-        const uint32_t rows = std::min(th, info.original_height - ty);
-        const size_t span =
-            (size_t)std::min(tw, info.original_width - tx) * pixel;
-        for (uint32_t r = 0; r < rows; r++) {
-          memcpy(m_buffer.data() + row_stride * (ty + r) + (size_t)tx * pixel,
-                 tile.data() + (size_t)tile_row * r, span);
+        const uint64_t cx = std::max<uint64_t>(tx, x0);
+        const uint64_t cy = std::max<uint64_t>(ty, y0);
+        const uint64_t ex = std::min<uint64_t>(tx + tw, x1);
+        const uint64_t ey = std::min<uint64_t>(ty + th, y1);
+        for (uint64_t y = cy; y < ey; y++) {
+          memcpy(m_buffer.data() + row_stride * (y - top) +
+                     (size_t)(cx - x0) * pixel,
+                 tile.data() + (size_t)tile_row * (y - ty) +
+                     (size_t)(cx - tx) * pixel,
+                 (size_t)(ex - cx) * pixel);
         }
       }
-    }
-  } else {
-    for (uint32_t y = 0; y < info.original_height; y++) {
-      if (TIFFReadScanline(m_tiff, m_buffer.data() + row_stride * y, y, 0) <
-          0) {
-        throw std::runtime_error("Truncated or corrupt TIFF");
+      if (band) {
+        const uint64_t by = std::max<uint64_t>(ty, y0);
+        finish((uint32_t)(by - y0),
+               (uint32_t)(std::min<uint64_t>(ty + th, y1) - by));
       }
     }
-  }
-  if (m_associated_alpha && dec.has_alpha) {
-    if (dec.bits == 16) {
-      unpremultiply<uint16_t>(m_buffer.data(), row_stride, dec.original_width,
-                              dec.original_height, dec.components);
-    } else {
-      unpremultiply<uint8_t>(m_buffer.data(), row_stride, dec.original_width,
-                             dec.original_height, dec.components);
+    if (!band) {
+      finish(0, info.original_height);
+    }
+  } else {
+    // A region starts on a strip boundary, full width (begin_region).
+    const uint32_t y0 = m_region.width != 0 ? m_region.y : 0;
+    const uint32_t rows = band ? 64 : info.original_height;
+    m_buffer.assign(
+        checked_buffer_bytes(row_stride, std::min(rows, info.original_height)),
+        0);
+    for (uint32_t y = 0; y < info.original_height; y += rows) {
+      const uint32_t n = std::min(rows, info.original_height - y);
+      for (uint32_t r = 0; r < n; r++) {
+        const uint32_t at = band ? r : y + r;
+        if (TIFFReadScanline(m_tiff, m_buffer.data() + row_stride * at,
+                             y0 + y + r, 0) < 0) {
+          throw std::runtime_error("Truncated or corrupt TIFF");
+        }
+      }
+      if (band) {
+        finish(y, n);
+      }
+    }
+    if (!band) {
+      finish(0, info.original_height);
     }
   }
 }
@@ -328,9 +417,22 @@ void TiffDecoder::read_rgba(const DecodeOptions &opts) {
   }
 
   // The file's own orientation, so libtiff doesn't turn; decode() does.
-  if (!TIFFReadRGBAImageOriented(m_tiff, info.original_width,
-                                 info.original_height, dst,
-                                 (int)info.orientation, 0)) {
+  // Offsets read just the region's rows (strips/tiles meeting them).
+  char emsg[1024] = "";
+  TIFFRGBAImage img;
+  if (!TIFFRGBAImageOK(m_tiff, emsg) ||
+      !TIFFRGBAImageBegin(&img, m_tiff, 0, emsg)) {
+    throw std::runtime_error("Failed to decode TIFF");
+  }
+  img.req_orientation = (uint16_t)info.orientation;
+  if (m_region.width != 0) {
+    img.col_offset = (int)m_region.x;
+    img.row_offset = (int)m_region.y;
+  }
+  const int ok =
+      TIFFRGBAImageGet(&img, dst, info.original_width, info.original_height);
+  TIFFRGBAImageEnd(&img);
+  if (!ok) {
     throw std::runtime_error("Failed to decode TIFF");
   }
 

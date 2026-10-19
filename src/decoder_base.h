@@ -357,6 +357,21 @@ public:
   // the whole file. A throw here, or one earlier, leaves the decoder failed.
   void rewind();
 
+  /* The first frame alone, cropped to `rect` (in turned coordinates when the
+   * options turn), or whole when null. Needs the whole file; rewinds first if
+   * anything was decoded, so the decoder can be reused for region after region.
+   * The next decode() call starts over from frame 0.
+   * The result's width/height (and stride) are the region's; original_* stay
+   * the image's.
+   * A sample above 1 shrinks the region to ceil(size / sample), needing an
+   * Rgba output mode: by the codec's own scaling where it has one (JPEG,
+   * WebP, JPEG 2000), else to the nearest pixels. Codecs that can shrink or
+   * stream rows do so while decoding, so the region is never whole at full
+   * size. */
+  DecodeProgress decode_region(const DecodeOptions &options,
+                               const InvalidRect *rect = nullptr,
+                               uint32_t sample = 1);
+
   const std::vector<uint8_t> &buffer() const { return m_buffer; }
 
   std::vector<uint8_t> take_buffer() { return std::move(m_buffer); }
@@ -391,6 +406,61 @@ protected:
   // keeps its state; the rest start over.
   virtual void rewind_codec() { restart(); }
 
+  /* Region decoding: `want` is in stored coordinates, inside the image. Returns
+   * the rect the codec will make (containing `want`, e.g. widened to block
+   * boundaries); the default makes the whole image, cropped afterwards.
+   *
+   * Called after read_header() on a fresh (rewound) codec, before the first
+   * decode_impl(). Until that frame finishes, info.original_width/height (and
+   * width/height) are the returned rect's size, so the buffer, stride and
+   * rows the codec writes are the made rect's alone; m_region holds where it
+   * lies in the image. Only the first frame is decoded. */
+  virtual InvalidRect begin_region(const InvalidRect &want) {
+    (void)want;
+    m_region = InvalidRect{0, 0, info.original_width, info.original_height};
+    return m_region;
+  }
+
+  // The made rect during a region decode, in stored coordinates; else empty.
+  InvalidRect m_region;
+
+  /* Sampled region decoding: called before begin_region() with the sample
+   * (above 1), and the largest power of two dividing it that the request's
+   * stored x and y are multiples of: a codec whose scaled pixels sit on a grid
+   * of its own keeps to that, so they line up with the sample's blocks.
+   * `want` is the request widened to whole blocks of the sample (clipped to
+   * the image), which begin_region() gets when the codec returns the sample
+   * itself; otherwise it gets the request. Returns the factor the codec
+   * itself shrinks by, which must divide the sample; 1 by default. A codec
+   * scaling all the way must keep made.x - want.x and made.y - want.y
+   * multiples of the sample.
+   * A codec returning f > 1 makes the made rect at
+   * ceil(size / f) (info.original_* say so until the frame finishes) and
+   * keeps it in m_scale. begin_region() still takes and returns full-size
+   * rects. */
+  virtual uint32_t begin_scale(uint32_t sample, uint32_t aligned,
+                               const InvalidRect &want) {
+    (void)sample;
+    (void)aligned;
+    (void)want;
+    return 1;
+  }
+  uint32_t m_scale = 1;
+
+  /* During a sampled decode, a codec whose finished rows come out in order
+   * may hand them over here (after finish_layout) instead of keeping them;
+   * rows y.. of the made image, `first` pointing at row y. A codec that does
+   * so must hand over every row, and its buffer need not hold the frame. */
+  bool sampling_rows() const { return m_sampler != nullptr; }
+  void emit_rows(const uint8_t *first, size_t stride, uint32_t y, uint32_t n);
+  /* For a codec whose frame sits decoded in a buffer of its own: its `rows`
+   * rows (as `dec` lays them out, `src_stride` apart) a band at a time
+   * through m_buffer, converted (srgb if given, then finish_layout) and
+   * handed on. */
+  void emit_frame(const uint8_t *src, size_t src_stride, const ImageInfo &dec,
+                  const DecodeOptions &opts, const SrgbTransform *srgb,
+                  uint32_t rows);
+
   void finish_layout(uint8_t *base, size_t stride, const ImageInfo &dec,
                      const DecodeOptions &opts, uint32_t y, uint32_t height);
 
@@ -421,9 +491,71 @@ private:
   bool m_shown_valid = false;
   ImageInfo m_shown;
   size_t m_shown_stride = 0;
+  // Something was decoded since the last rewind.
+  bool m_started = false;
+  // Codec state is region-sized, so decode() must rewind first.
+  bool m_region_done = false;
   // A throw leaves the codec mid-operation, so every later call repeats it.
   std::exception_ptr m_error;
+  std::unique_ptr<class RowSampler> m_sampler;
+
+  DecodeProgress decode_region_once(const DecodeOptions &options,
+                                    const InvalidRect *rect, uint32_t sample);
+  // `native`: let the codec shrink by itself; a refusal retries without.
+  DecodeProgress decode_sampled(const DecodeOptions &options,
+                                const InvalidRect &want, uint32_t sample,
+                                bool native = true);
+  DecodeProgress finish_sampled(DecodeProgress progress,
+                                std::vector<uint8_t> &&out,
+                                const ImageInfo &full, uint32_t ow, uint32_t oh,
+                                uint32_t orientation);
 };
+
+/* Shrinks a frame whose rows arrive in order to its nearest pixels: output
+ * pixel i is the first of input [start + i*k - phase, start + (i+1)*k -
+ * phase) clipped to [start, end), or the last where `last` (an axis the
+ * turn reverses, so it's first once turned), on each axis. Only those rows
+ * are read. */
+class RowSampler final {
+public:
+  struct Axis final {
+    uint32_t start = 0;
+    uint32_t end = 0;
+    uint32_t k = 1;
+    uint32_t phase = 0;
+    uint32_t out = 0;
+    bool last = false;
+  };
+
+  RowSampler(size_t pixel_bytes, Axis x, Axis y);
+
+  void feed(const uint8_t *first, size_t stride, uint32_t y, uint32_t n);
+
+  // Rows fed so far, in [y.start, y.end); all of them once all are in.
+  uint32_t fed() const { return m_fed; }
+  bool streamed = false;
+
+  // The out.x by out.y frame, packed.
+  std::vector<uint8_t> finish();
+
+private:
+  size_t m_pixel;
+  Axis m_x;
+  Axis m_y;
+  std::vector<uint32_t> m_cols; // input column of each output one
+  std::vector<uint32_t> m_rows; // input row of each output one
+  std::vector<uint8_t> m_out;
+  uint32_t m_row = 0; // next output row to fill
+  uint32_t m_fed = 0;
+  uint32_t m_next = 0;
+};
+
+// A stored-coordinate rect of a w x h image, turned per orientation, and back
+// (w x h being the stored size both ways).
+InvalidRect turn_rect(const InvalidRect &r, uint32_t orientation, uint32_t w,
+                      uint32_t h);
+InvalidRect unturn_rect(const InvalidRect &r, uint32_t orientation, uint32_t w,
+                        uint32_t h);
 
 // Packs original_width x original_height pixels, turned per orientation.
 std::vector<uint8_t> orient_copy(const uint8_t *src, size_t stride,

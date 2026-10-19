@@ -3,6 +3,7 @@
 #include <libheif/heif_sequences.h>
 
 #include <libheif/heif_items.h>
+#include <libheif/heif_tiling.h>
 
 #include <algorithm>
 #include <cmath>
@@ -307,6 +308,9 @@ BaseDecoder::StepResult HeifDecoder::decode_impl(const DecodeOptions &opts) {
   if (m_complete) {
     return {true, 0, {}};
   }
+  if (m_region.empty()) {
+    m_tiles = false;
+  }
 
   ImageInfo dec = info;
   if (dec.color == ColorFamily::YUV &&
@@ -318,10 +322,13 @@ BaseDecoder::StepResult HeifDecoder::decode_impl(const DecodeOptions &opts) {
     dec.full_range = true;
   }
   const size_t work_stride = layout_stride(dec, opts);
+  m_srgb_rows.reset();
 
   const bool planar = dec.color == ColorFamily::YUV;
-  const heif_channel single =
-      m_mono ? heif_channel_Y : heif_channel_interleaved;
+  // Planar regions would be cropped by the base, which it cannot do.
+  if (planar && m_tiles) {
+    throw std::runtime_error("Planar output cannot be cropped");
+  }
   heif_colorspace space = heif_colorspace_RGB;
   heif_chroma chroma;
   if (planar) {
@@ -363,7 +370,7 @@ BaseDecoder::StepResult HeifDecoder::decode_impl(const DecodeOptions &opts) {
       m_advance_frame = false;
       m_frame++;
     }
-  } else {
+  } else if (!m_tiles) {
     err = heif_decode_image(m_handle, &image, space, chroma, nullptr);
     if (err.code != heif_error_Ok || !image) {
       throw std::runtime_error(err.message ? err.message
@@ -381,75 +388,36 @@ BaseDecoder::StepResult HeifDecoder::decode_impl(const DecodeOptions &opts) {
   } image_guard{image};
 
   int decoded_bits = m_luma_bits;
-  if (planar) {
+  // Sampled stills go on a band at a time, so no region-sized frame is kept.
+  const bool streamed = sampling_rows() && !planar && !m_track;
+  if (streamed && m_tiles) {
+    decoded_bits =
+        decode_tiles(space, chroma, dec, work_stride,
+                     [&](uint32_t y, uint32_t rows, int bits) {
+                       finish_rows(dec, opts, work_stride, bits, 0, rows);
+                       emit_rows(m_buffer.data(), work_stride, y, rows);
+                     });
+  } else if (streamed) {
+    const uint32_t band = 64;
+    m_buffer.resize(checked_buffer_bytes(work_stride,
+                                         std::min(band, info.original_height)));
+    for (uint32_t y = 0; y < info.original_height; y += band) {
+      const uint32_t rows = std::min(band, info.original_height - y);
+      decoded_bits = copy_pixels(image, dec, work_stride, 0, 0, 0, y,
+                                 info.original_width, rows);
+      finish_rows(dec, opts, work_stride, decoded_bits, 0, rows);
+      emit_rows(m_buffer.data(), work_stride, y, rows);
+    }
+  } else if (planar) {
     copy_planes(image, dec);
   } else {
-    decoded_bits = heif_image_get_bits_per_pixel_range(image, single);
-    int src_stride = 0;
-    const uint8_t *src =
-        heif_image_get_plane_readonly(image, single, &src_stride);
-    if (!src || src_stride <= 0) {
-      throw std::runtime_error("HEIF image has no pixels");
-    }
-
     // Stale bytes only in row padding, which decode() compacts away.
     m_buffer.resize(checked_buffer_bytes(work_stride, info.original_height));
-
-    if (heif_image_get_height(image, single) < (int)info.original_height ||
-        heif_image_get_width(image, single) < (int)info.original_width) {
-      throw std::runtime_error("HEIF frame is smaller than its declared size");
-    }
-
-    if (m_mono && dec.has_alpha) {
-      /* libheif keeps alpha in a plane of its own, which may have its own
-       * depth; it is brought to the luma's range as gray+alpha interleaves. */
-      int alpha_stride = 0;
-      const uint8_t *alpha = heif_image_get_plane_readonly(
-          image, heif_channel_Alpha, &alpha_stride);
-      const int alpha_bits =
-          heif_image_get_bits_per_pixel_range(image, heif_channel_Alpha);
-      const size_t sample = info.bits == 16 ? 2 : 1;
-      const size_t alpha_sample = alpha_bits > 8 ? 2 : 1;
-      if (!alpha || alpha_stride <= 0 || alpha_bits < 1 || alpha_bits > 16 ||
-          decoded_bits < 1 || decoded_bits > 16 ||
-          (size_t)alpha_stride < info.original_width * alpha_sample ||
-          (size_t)src_stride < info.original_width * sample ||
-          heif_image_get_width(image, heif_channel_Alpha) <
-              (int)info.original_width ||
-          heif_image_get_height(image, heif_channel_Alpha) <
-              (int)info.original_height) {
-        throw std::runtime_error("HEIF alpha plane is missing or too small");
-      }
-      const uint32_t alpha_max = (1u << alpha_bits) - 1;
-      const uint32_t luma_max = (1u << decoded_bits) - 1;
-      for (uint32_t y = 0; y < info.original_height; y++) {
-        uint8_t *dst = m_buffer.data() + work_stride * y;
-        const uint8_t *ys = src + (size_t)src_stride * y;
-        const uint8_t *as = alpha + (size_t)alpha_stride * y;
-        for (uint32_t x = 0; x < info.original_width; x++) {
-          uint32_t a = alpha_sample == 2 ? ((const uint16_t *)as)[x] : as[x];
-          a = std::min(a, alpha_max);
-          if (alpha_max != luma_max) {
-            a = (a * luma_max + alpha_max / 2) / alpha_max;
-          }
-          if (sample == 2) {
-            ((uint16_t *)dst)[x * 2] = ((const uint16_t *)ys)[x];
-            ((uint16_t *)dst)[x * 2 + 1] = (uint16_t)a;
-          } else {
-            dst[x * 2] = ys[x];
-            dst[x * 2 + 1] = (uint8_t)a;
-          }
-        }
-      }
+    if (m_tiles) {
+      decoded_bits = decode_tiles(space, chroma, dec, work_stride);
     } else {
-      if ((size_t)src_stride < row_bytes(dec)) {
-        throw std::runtime_error("HEIF plane is narrower than its image");
-      }
-      const size_t copy = std::min((size_t)src_stride, row_bytes(dec));
-      for (uint32_t y = 0; y < info.original_height; y++) {
-        memcpy(m_buffer.data() + work_stride * y, src + (size_t)src_stride * y,
-               copy);
-      }
+      decoded_bits = copy_pixels(image, dec, work_stride, 0, 0, 0, 0,
+                                 info.original_width, info.original_height);
     }
   }
 
@@ -463,60 +431,8 @@ BaseDecoder::StepResult HeifDecoder::decode_impl(const DecodeOptions &opts) {
   heif_image_release(image);
   image_guard.img = nullptr;
 
-  if (!planar) {
-    if (info.bits == 16 && decoded_bits > 0 && decoded_bits < 16) {
-      const uint32_t in_max = (1u << decoded_bits) - 1;
-      const size_t per_row = (size_t)info.original_width * dec.components;
-
-      for (uint32_t y = 0; y < info.original_height; y++) {
-        uint16_t *row = (uint16_t *)(m_buffer.data() + work_stride * y);
-        for (size_t i = 0; i < per_row; i++) {
-          uint32_t v = row[i];
-          if (v > in_max) {
-            v = in_max;
-          }
-          row[i] = (uint16_t)((v * 65535u + in_max / 2) / in_max);
-        }
-      }
-    }
-
-    const uint32_t n = dec.components;
-    if (m_premultiplied && dec.has_alpha && n >= 2) {
-      const uint32_t max = info.bits == 16 ? 65535u : 255u;
-      for (uint32_t y = 0; y < dec.original_height; y++) {
-        uint8_t *row = m_buffer.data() + work_stride * y;
-        for (uint32_t x = 0; x < dec.original_width; x++) {
-          if (info.bits == 16) {
-            uint16_t *p = (uint16_t *)row + (size_t)x * n;
-            const uint32_t a = p[n - 1];
-            if (a == 0 || a >= max) {
-              continue;
-            }
-            for (uint32_t c = 0; c + 1 < n; c++) {
-              uint32_t v = ((uint32_t)p[c] * max + a / 2) / a;
-              p[c] = (uint16_t)(v > max ? max : v);
-            }
-          } else {
-            uint8_t *p = row + (size_t)x * n;
-            const uint32_t a = p[n - 1];
-            if (a == 0 || a >= max) {
-              continue;
-            }
-            for (uint32_t c = 0; c + 1 < n; c++) {
-              uint32_t v = ((uint32_t)p[c] * max + a / 2) / a;
-              p[c] = (uint8_t)(v > max ? max : v);
-            }
-          }
-        }
-      }
-    }
-
-    if (opts.srgb_output) {
-      SrgbTransform(dec, m_src_profile, true)
-          .apply(m_buffer.data(), work_stride, 0, dec.original_height);
-    }
-    finish_layout(m_buffer.data(), work_stride, dec, opts, 0,
-                  dec.original_height);
+  if (!planar && !streamed) {
+    finish_rows(dec, opts, work_stride, decoded_bits, 0, dec.original_height);
   }
 
   if (!m_track) {
@@ -545,6 +461,243 @@ BaseDecoder::StepResult HeifDecoder::decode_impl(const DecodeOptions &opts) {
   }
   // A bad next frame fails on the call that reaches it, not this one.
   return {false, work_stride, {}};
+}
+
+/* Copies w x h from (sx, sy) of an interleaved or mono decode to (dx, dy) of
+ * the buffer; returns the decode's bit depth. */
+int HeifDecoder::copy_pixels(heif_image *image, const ImageInfo &dec,
+                             size_t work_stride, uint32_t dx, uint32_t dy,
+                             uint32_t sx, uint32_t sy, uint32_t w, uint32_t h) {
+  const heif_channel single =
+      m_mono ? heif_channel_Y : heif_channel_interleaved;
+  const int decoded_bits = heif_image_get_bits_per_pixel_range(image, single);
+  int src_stride = 0;
+  const uint8_t *src =
+      heif_image_get_plane_readonly(image, single, &src_stride);
+  if (!src || src_stride <= 0) {
+    throw std::runtime_error("HEIF image has no pixels");
+  }
+  if (heif_image_get_height(image, single) < (int)(sy + h) ||
+      heif_image_get_width(image, single) < (int)(sx + w)) {
+    throw std::runtime_error("HEIF frame is smaller than its declared size");
+  }
+
+  const size_t sample = info.bits == 16 ? 2 : 1;
+  if (m_mono && dec.has_alpha) {
+    /* libheif keeps alpha in a plane of its own, which may have its own
+     * depth; it is brought to the luma's range as gray+alpha interleaves. */
+    int alpha_stride = 0;
+    const uint8_t *alpha =
+        heif_image_get_plane_readonly(image, heif_channel_Alpha, &alpha_stride);
+    const int alpha_bits =
+        heif_image_get_bits_per_pixel_range(image, heif_channel_Alpha);
+    const size_t alpha_sample = alpha_bits > 8 ? 2 : 1;
+    if (!alpha || alpha_stride <= 0 || alpha_bits < 1 || alpha_bits > 16 ||
+        decoded_bits < 1 || decoded_bits > 16 ||
+        (size_t)alpha_stride < (sx + w) * alpha_sample ||
+        (size_t)src_stride < (sx + w) * sample ||
+        heif_image_get_width(image, heif_channel_Alpha) < (int)(sx + w) ||
+        heif_image_get_height(image, heif_channel_Alpha) < (int)(sy + h)) {
+      throw std::runtime_error("HEIF alpha plane is missing or too small");
+    }
+    const uint32_t alpha_max = (1u << alpha_bits) - 1;
+    const uint32_t luma_max = (1u << decoded_bits) - 1;
+    for (uint32_t y = 0; y < h; y++) {
+      uint8_t *dst = m_buffer.data() + work_stride * (dy + y);
+      const uint8_t *ys = src + (size_t)src_stride * (sy + y);
+      const uint8_t *as = alpha + (size_t)alpha_stride * (sy + y);
+      for (uint32_t i = 0; i < w; i++) {
+        const uint32_t x = sx + i, o = dx + i;
+        uint32_t a = alpha_sample == 2 ? ((const uint16_t *)as)[x] : as[x];
+        a = std::min(a, alpha_max);
+        if (alpha_max != luma_max) {
+          a = (a * luma_max + alpha_max / 2) / alpha_max;
+        }
+        if (sample == 2) {
+          ((uint16_t *)dst)[o * 2] = ((const uint16_t *)ys)[x];
+          ((uint16_t *)dst)[o * 2 + 1] = (uint16_t)a;
+        } else {
+          dst[o * 2] = ys[x];
+          dst[o * 2 + 1] = (uint8_t)a;
+        }
+      }
+    }
+  } else {
+    const size_t pixel = (size_t)dec.components * sample;
+    if ((size_t)src_stride < (sx + w) * pixel) {
+      throw std::runtime_error("HEIF plane is narrower than its image");
+    }
+    for (uint32_t y = 0; y < h; y++) {
+      memcpy(m_buffer.data() + work_stride * (dy + y) + dx * pixel,
+             src + (size_t)src_stride * (sy + y) + sx * pixel, w * pixel);
+    }
+  }
+  return decoded_bits;
+}
+
+/* Rows y.. of the buffer, as decoded, to the layout: widened to 16 bits,
+ * alpha unpremultiplied, to sRGB and on. */
+void HeifDecoder::finish_rows(const ImageInfo &dec, const DecodeOptions &opts,
+                              size_t work_stride, int decoded_bits, uint32_t y,
+                              uint32_t rows) {
+  if (info.bits == 16 && decoded_bits > 0 && decoded_bits < 16) {
+    const uint32_t in_max = (1u << decoded_bits) - 1;
+    const size_t per_row = (size_t)info.original_width * dec.components;
+    for (uint32_t r = y; r < y + rows; r++) {
+      uint16_t *row = (uint16_t *)(m_buffer.data() + work_stride * r);
+      for (size_t i = 0; i < per_row; i++) {
+        uint32_t v = row[i];
+        if (v > in_max) {
+          v = in_max;
+        }
+        row[i] = (uint16_t)((v * 65535u + in_max / 2) / in_max);
+      }
+    }
+  }
+
+  const uint32_t n = dec.components;
+  if (m_premultiplied && dec.has_alpha && n >= 2) {
+    const uint32_t max = info.bits == 16 ? 65535u : 255u;
+    for (uint32_t r = y; r < y + rows; r++) {
+      uint8_t *row = m_buffer.data() + work_stride * r;
+      for (uint32_t x = 0; x < dec.original_width; x++) {
+        if (info.bits == 16) {
+          uint16_t *p = (uint16_t *)row + (size_t)x * n;
+          const uint32_t a = p[n - 1];
+          if (a == 0 || a >= max) {
+            continue;
+          }
+          for (uint32_t c = 0; c + 1 < n; c++) {
+            uint32_t v = ((uint32_t)p[c] * max + a / 2) / a;
+            p[c] = (uint16_t)(v > max ? max : v);
+          }
+        } else {
+          uint8_t *p = row + (size_t)x * n;
+          const uint32_t a = p[n - 1];
+          if (a == 0 || a >= max) {
+            continue;
+          }
+          for (uint32_t c = 0; c + 1 < n; c++) {
+            uint32_t v = ((uint32_t)p[c] * max + a / 2) / a;
+            p[c] = (uint8_t)(v > max ? max : v);
+          }
+        }
+      }
+    }
+  }
+
+  if (opts.srgb_output) {
+    if (!m_srgb_rows) {
+      m_srgb_rows = std::make_unique<SrgbTransform>(dec, m_src_profile, true);
+    }
+    m_srgb_rows->apply(m_buffer.data(), work_stride, y, rows);
+  }
+  finish_layout(m_buffer.data(), work_stride, dec, opts, y, rows);
+}
+
+// Decodes the tiles meeting m_region into it; returns their bit depth.
+int HeifDecoder::decode_tiles(
+    heif_colorspace space, heif_chroma chroma, const ImageInfo &dec,
+    size_t work_stride,
+    const std::function<void(uint32_t, uint32_t, int)> &band) {
+  const heif_image_tiling &t = m_tiling;
+  const uint32_t rx = m_region.x + t.left_offset;
+  const uint32_t ry = m_region.y + t.top_offset;
+  int bits = m_luma_bits;
+  for (uint32_t ty = ry / t.tile_height;
+       ty <= (ry + m_region.height - 1) / t.tile_height; ty++) {
+    // A band is this tile row's overlap with the region, from its top.
+    const uint32_t band_y0 = std::max(ty * t.tile_height, ry);
+    const uint32_t band_y1 =
+        std::min((ty + 1) * t.tile_height, ry + m_region.height);
+    if (band) {
+      m_buffer.resize(checked_buffer_bytes(work_stride, band_y1 - band_y0));
+    }
+    const uint32_t top = band ? band_y0 : ry;
+    for (uint32_t tx = rx / t.tile_width;
+         tx <= (rx + m_region.width - 1) / t.tile_width; tx++) {
+      heif_image *tile = nullptr;
+      heif_error err = heif_image_handle_decode_image_tile(
+          m_handle, &tile, space, chroma, nullptr, tx, ty);
+      if (err.code != heif_error_Ok || !tile) {
+        throw std::runtime_error(err.message ? err.message
+                                             : "Failed to decode HEIF tile");
+      }
+      // Overlap of the tile and the region, in tiling coordinates.
+      const uint32_t x0 = std::max(tx * t.tile_width, rx);
+      const uint32_t y0 = std::max(ty * t.tile_height, ry);
+      const uint32_t x1 =
+          std::min((tx + 1) * t.tile_width, rx + m_region.width);
+      const uint32_t y1 =
+          std::min((ty + 1) * t.tile_height, ry + m_region.height);
+      try {
+        bits = copy_pixels(tile, dec, work_stride, x0 - rx, y0 - top,
+                           x0 - tx * t.tile_width, y0 - ty * t.tile_height,
+                           x1 - x0, y1 - y0);
+      } catch (...) {
+        heif_image_release(tile);
+        throw;
+      }
+      heif_image_release(tile);
+    }
+    if (band) {
+      band(band_y0 - ry, band_y1 - band_y0, bits);
+    }
+  }
+  return bits;
+}
+
+InvalidRect HeifDecoder::begin_region(const InvalidRect &want) {
+  m_tiles = false;
+  m_region = InvalidRect{0, 0, info.original_width, info.original_height};
+  heif_image_tiling &t = m_tiling;
+  t = {};
+  /* Sequences and single-tile images decode whole, as does alpha: libheif
+   * pairs alpha with tiles only when it shares the grid. */
+  if (m_track || info.has_alpha || !m_handle ||
+      heif_image_handle_get_image_tiling(m_handle, 1, &t).code !=
+          heif_error_Ok ||
+      (t.num_columns <= 1 && t.num_rows <= 1) || !t.tile_width ||
+      !t.tile_height || t.image_width != info.original_width ||
+      t.image_height != info.original_height) {
+    return m_region;
+  }
+  /* A turn or flip moves the grid's padding to the left or top. libheif
+   * 1.23 reports the remainder there, not the padding, so it is redone. */
+  const uint64_t pad_x = (uint64_t)t.num_columns * t.tile_width;
+  const uint64_t pad_y = (uint64_t)t.num_rows * t.tile_height;
+  if (pad_x < t.image_width || pad_x - t.image_width >= t.tile_width ||
+      pad_y < t.image_height || pad_y - t.image_height >= t.tile_height) {
+    return m_region;
+  }
+  t.left_offset = t.left_offset ? (uint32_t)(pad_x - t.image_width) : 0;
+  t.top_offset = t.top_offset ? (uint32_t)(pad_y - t.image_height) : 0;
+  // Tile-aligned, the grid starting at (-left_offset, -top_offset).
+  auto span = [](uint32_t a, uint32_t len, uint32_t off, uint32_t tile,
+                 uint32_t full, uint32_t &out_a, uint32_t &out_len) {
+    const uint64_t s = (uint64_t)(a + off) / tile * tile;
+    const uint64_t e = ((uint64_t)a + len + off + tile - 1) / tile * tile;
+    out_a = (uint32_t)(s > off ? s - off : 0);
+    out_len = (uint32_t)std::min<uint64_t>(e - off, full) - out_a;
+  };
+  InvalidRect made;
+  span(want.x, want.width, t.left_offset, t.tile_width, info.original_width,
+       made.x, made.width);
+  span(want.y, want.height, t.top_offset, t.tile_height, info.original_height,
+       made.y, made.height);
+  // libheif decodes a whole grid's tiles in parallel, these one by one.
+  const uint64_t cols =
+      (made.x + t.left_offset + made.width - 1) / t.tile_width -
+      (made.x + t.left_offset) / t.tile_width + 1;
+  const uint64_t rows =
+      (made.y + t.top_offset + made.height - 1) / t.tile_height -
+      (made.y + t.top_offset) / t.tile_height + 1;
+  if (cols * rows * 2 > (uint64_t)t.num_columns * t.num_rows) {
+    return m_region;
+  }
+  m_tiles = true;
+  m_region = made;
+  return m_region;
 }
 
 /* ISO 21496-1: a tmap item derives from (dimg) the primary image and the gain
@@ -694,6 +847,7 @@ const GainmapData *HeifDecoder::gainmap() {
 
 void HeifDecoder::restart() {
   close();
+  m_tiles = false;
   m_has_info = false;
   m_complete = false;
   m_hdr_kind = HdrKind::None;

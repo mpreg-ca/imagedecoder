@@ -245,7 +245,9 @@ BaseDecoder::StepResult JpegDecoder::decode_impl(const DecodeOptions &opts) {
       m_raw.assign(raw, 0);
     } else {
       stride = layout_stride(m_dec_layout, opts);
-      bytes = checked_buffer_bytes(stride, info.original_height);
+      // Sampled rows go on as they finish, so one is all that's kept.
+      bytes = checked_buffer_bytes(stride,
+                                   sampling_rows() ? 1 : info.original_height);
     }
     if (cmyk) {
       open_cmyk_transform();
@@ -267,12 +269,15 @@ BaseDecoder::StepResult JpegDecoder::decode_impl(const DecodeOptions &opts) {
         : m_dec_layout.color == ColorFamily::YUV  ? JCS_YCbCr
                                                   : JCS_RGB;
     dinfo->raw_data_out = m_planar;
+    dinfo->scale_num = 1;
+    dinfo->scale_denom = m_scale;
     dinfo->do_fancy_upsampling = TRUE;
     dinfo->dct_method = JDCT_ISLOW;
     // Worth much more here than in a plain decode: shows the early scans.
     dinfo->do_block_smoothing = TRUE;
 
-    dinfo->buffered_image = m_progressive;
+    // A region decodes in one pass, where crop and skip work.
+    dinfo->buffered_image = m_progressive && m_region.empty();
     m_stage = Stage::Start;
   }
 
@@ -285,16 +290,36 @@ BaseDecoder::StepResult JpegDecoder::decode_impl(const DecodeOptions &opts) {
       return {};
     }
     const uint32_t components = cmyk ? 4 : m_dec_layout.components;
-    if (dinfo->output_width != info.original_width ||
-        dinfo->output_height != info.original_height ||
+    if (dinfo->output_width != (dinfo->image_width + m_scale - 1) / m_scale ||
+        dinfo->output_height != (dinfo->image_height + m_scale - 1) / m_scale ||
         (uint32_t)dinfo->output_components > components) {
       detach_source();
       throw std::runtime_error("JPEG output does not match its header");
+    }
+    if (!m_region.empty() && !m_planar) {
+      if (m_region.width < dinfo->output_width) {
+        JDIMENSION x = m_region.x;
+        JDIMENSION w = m_region.width;
+        jpeg_crop_scanline(dinfo, &x, &w);
+        if (x != m_region.x || w != m_region.width) {
+          detach_source();
+          throw std::runtime_error("JPEG crop differs from its region");
+        }
+      }
+      if (m_region.y > 0 &&
+          jpeg_skip_scanlines(dinfo, m_region.y) != m_region.y) {
+        detach_source();
+        throw std::runtime_error("Truncated JPEG");
+      }
     }
     m_stage = Stage::Scanlines;
   }
 
   bool finished = false;
+  // A region stops after its last row, never reading the rest.
+  const uint32_t top = m_region.y;
+  const uint32_t end =
+      m_region.empty() ? dinfo->output_height : top + m_region.height;
 
   while (m_stage == Stage::Scanlines && !finished) {
     if (dinfo->buffered_image && !m_in_output) {
@@ -340,19 +365,25 @@ BaseDecoder::StepResult JpegDecoder::decode_impl(const DecodeOptions &opts) {
       m_in_output = true;
     }
 
-    while (dinfo->output_scanline < dinfo->output_height) {
-      const uint32_t y = dinfo->output_scanline;
+    while (dinfo->output_scanline < end) {
       if (m_planar) {
-        const uint32_t rows = read_planar_rows(y);
+        const uint32_t rows = read_planar_rows(dinfo->output_scanline);
         if (rows == 0) {
           break;
         }
+        if (dinfo->output_scanline <= top) {
+          continue;
+        }
+        const uint32_t y = dinfo->output_scanline - rows - top;
         dirty.add(InvalidRect{0, y, info.original_width,
                               std::min(rows, info.original_height - y)});
         continue;
       }
 
-      uint8_t *row = m_buffer.data() + m_row_stride * y;
+      const uint32_t y = dinfo->output_scanline - top;
+      const bool stream = sampling_rows();
+      const uint32_t at = stream ? 0 : y;
+      uint8_t *row = m_buffer.data() + m_row_stride * at;
       uint8_t *dst = cmyk ? m_cmyk_row.data() : row;
       if (jpeg_read_scanlines(dinfo, &dst, 1) != 1) {
         break;
@@ -361,12 +392,15 @@ BaseDecoder::StepResult JpegDecoder::decode_impl(const DecodeOptions &opts) {
         cmsDoTransform(m_cmyk_transform, dst, row, info.original_width);
       }
 
-      m_srgb.apply(m_buffer.data(), m_row_stride, y, 1);
-      finish_layout(m_buffer.data(), m_row_stride, m_dec_layout, opts, y, 1);
+      m_srgb.apply(m_buffer.data(), m_row_stride, at, 1);
+      finish_layout(m_buffer.data(), m_row_stride, m_dec_layout, opts, at, 1);
+      if (stream) {
+        emit_rows(row, m_row_stride, y, 1);
+      }
       dirty.add(InvalidRect{0, y, info.original_width, 1});
     }
 
-    if (dinfo->output_scanline < dinfo->output_height) {
+    if (dinfo->output_scanline < end) {
       break;
     }
 
@@ -385,7 +419,11 @@ BaseDecoder::StepResult JpegDecoder::decode_impl(const DecodeOptions &opts) {
 
   if (finished) {
     m_stage = Stage::Done;
-    jpeg_finish_decompress(dinfo);
+    if (dinfo->output_scanline < dinfo->output_height) {
+      jpeg_abort_decompress(dinfo);
+    } else {
+      jpeg_finish_decompress(dinfo);
+    }
   }
 
   detach_source();
@@ -401,7 +439,8 @@ BaseDecoder::StepResult JpegDecoder::decode_impl(const DecodeOptions &opts) {
 }
 
 /* One iMCU row at luma row y into the planes; returns its height, 0 on
- * suspension. Via block-wide scratch, since libjpeg writes whole blocks. */
+ * suspension. Via block-wide scratch, since libjpeg writes whole blocks.
+ * Rows above a region are read and dropped (raw data can't skip). */
 uint32_t JpegDecoder::read_planar_rows(uint32_t y) {
   auto *dinfo = &m_jinfo;
   const uint32_t rows = DCTSIZE * dinfo->comp_info[0].v_samp_factor;
@@ -425,13 +464,21 @@ uint32_t JpegDecoder::read_planar_rows(uint32_t y) {
     return 0;
   }
 
+  if (y < m_region.y) {
+    return rows;
+  }
+  y -= m_region.y;
+
   uint8_t *plane = m_buffer.data();
   for (int c = 0; c < 3; c++) {
     const uint32_t n = c == 0 ? rows : DCTSIZE;
     const uint32_t first = y / rows * n;
+    const uint32_t x = m_region.x * dinfo->comp_info[c].h_samp_factor /
+                       dinfo->max_h_samp_factor;
     JSAMPARRAY src = planes[c];
     for (uint32_t i = 0; i < n && first + i < m_plane_h[c]; i++) {
-      memcpy(plane + (size_t)m_plane_w[c] * (first + i), src[i], m_plane_w[c]);
+      memcpy(plane + (size_t)m_plane_w[c] * (first + i), src[i] + x,
+             m_plane_w[c]);
     }
     plane += (size_t)m_plane_w[c] * m_plane_h[c];
   }
@@ -536,6 +583,59 @@ const GainmapData *JpegDecoder::gainmap() {
 
   uhdr_release_decoder(dec);
   return m_gainmap.empty() ? nullptr : &m_gainmap;
+}
+
+/* x widened down to libjpeg-turbo's crop alignment (the iMCU column); the
+ * planar path, which reads whole iMCU rows, also widens y to iMCU rows.
+ * Worked out in output pixels, which m_region keeps: 1/m_scale of the image's
+ * when scaling. */
+InvalidRect JpegDecoder::begin_region(const InvalidRect &want) {
+  const uint32_t f = m_scale;
+  const uint32_t w = m_jinfo.image_width;
+  const uint32_t h = m_jinfo.image_height;
+  const uint32_t ow = (w + f - 1) / f;
+  const uint32_t oh = (h + f - 1) / f;
+  // An iMCU column in output pixels, as jpeg_crop_scanline aligns.
+  const uint32_t block = DCTSIZE / f;
+  const uint32_t align =
+      m_jinfo.num_components == 1 ? block : block * m_jinfo.max_h_samp_factor;
+  uint32_t x0 = want.x / f / align * align;
+  uint32_t x1 = (uint32_t)(((uint64_t)want.x + want.width + f - 1) / f);
+  uint32_t y0 = want.y / f;
+  uint32_t y1 = (uint32_t)(((uint64_t)want.y + want.height + f - 1) / f);
+  // Fancy upsampling treats a crop's edges as the image's: an iMCU of slack.
+  if (m_jinfo.max_h_samp_factor > 1 && m_jinfo.num_components > 1) {
+    x0 = x0 >= align ? x0 - align : 0;
+    x1 = std::min((x1 + align - 1) / align * align + align, ow);
+  }
+  if (info.color == ColorFamily::YUV &&
+      (info.subsampling_w || info.subsampling_h)) {
+    const uint32_t rows = block * m_jinfo.max_v_samp_factor;
+    y0 = y0 / rows * rows;
+    y1 = std::min((y1 + rows - 1) / rows * rows, oh);
+  }
+  x1 = std::min(x1, ow);
+  y1 = std::min(y1, oh);
+  if (x0 == 0 && x1 == ow && y0 == 0 && y1 == oh) {
+    m_region = InvalidRect{0, 0, ow, oh};
+  } else {
+    m_region = InvalidRect{x0, y0, x1 - x0, y1 - y0};
+  }
+  // In the image's pixels; ceil(size / f) of them is m_region again.
+  return InvalidRect{
+      m_region.x * f, m_region.y * f,
+      std::min((m_region.x + m_region.width) * f, w) - m_region.x * f,
+      std::min((m_region.y + m_region.height) * f, h) - m_region.y * f};
+}
+
+// libjpeg-turbo scales by 1/2, 1/4 or 1/8 in the IDCT, never touching the
+// rest; 1/8 is each block's average, a box filter in itself.
+uint32_t JpegDecoder::begin_scale(uint32_t sample, uint32_t aligned,
+                                  const InvalidRect &want) {
+  (void)sample;
+  (void)want;
+  m_scale = std::min(aligned, 8u);
+  return m_scale;
 }
 
 void JpegDecoder::restart() {

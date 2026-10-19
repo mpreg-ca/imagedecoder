@@ -32,6 +32,7 @@ bool WebpDecoder::read_header() {
                    features.height < 0 ? 0 : (uint64_t)features.height);
 
   m_animated = features.has_animation != 0;
+  m_lossy = features.format == 1;
 
   bool alpha = features.has_alpha != 0 || m_animated;
 
@@ -98,6 +99,52 @@ void WebpDecoder::rewind_codec() {
   m_complete = false;
   m_prev_timestamp = 0;
   m_next_frame = 0;
+  // The next decode may lay out under other options.
+  m_row_stride = 0;
+  m_srgb_ready = false;
+}
+
+/* Lossy crops start on even coordinates, and fancy upsampling replicates
+ * chroma at crop edges, so a 2px margin keeps edge pixels identical. */
+InvalidRect WebpDecoder::begin_region(const InvalidRect &want) {
+  if (m_animated) {
+    return BaseDecoder::begin_region(want);
+  }
+  if (m_scale > 1) {
+    // want is whole blocks. The lossy margin is whole blocks too, and even,
+    // so libwebp scales by exactly the sample and the crop starts even.
+    const uint32_t m = m_lossy ? (m_scale % 2 ? 2 * m_scale : m_scale) : 0;
+    const uint32_t x1 = want.x + want.width, y1 = want.y + want.height;
+    const uint32_t x0 = want.x >= m ? want.x - m : want.x;
+    const uint32_t y0 = want.y >= m ? want.y - m : want.y;
+    const uint32_t x2 = info.original_width - x1 >= m ? x1 + m : x1;
+    const uint32_t y2 = info.original_height - y1 >= m ? y1 + m : y1;
+    m_region = InvalidRect{x0, y0, x2 - x0, y2 - y0};
+    return m_region;
+  }
+  uint32_t x0 = want.x, y0 = want.y;
+  uint32_t x1 = want.x + want.width, y1 = want.y + want.height;
+  if (m_lossy) {
+    x0 = (x0 & ~1u) >= 2 ? (x0 & ~1u) - 2 : 0;
+    y0 = (y0 & ~1u) >= 2 ? (y0 & ~1u) - 2 : 0;
+    x1 = std::min(x1 + 2, info.original_width);
+    y1 = std::min(y1 + 2, info.original_height);
+  }
+  m_region = InvalidRect{x0, y0, x1 - x0, y1 - y0};
+  return m_region;
+}
+
+/* libwebp crops, then area-averages the crop down to ceil(size / sample) as
+ * rows come, so the region never exists at full size. A lossy crop must
+ * start on even coordinates. */
+uint32_t WebpDecoder::begin_scale(uint32_t sample, uint32_t aligned,
+                                  const InvalidRect &want) {
+  (void)aligned;
+  if (m_animated || (m_lossy && ((want.x | want.y) & 1))) {
+    return 1;
+  }
+  m_scale = sample;
+  return m_scale;
 }
 
 void WebpDecoder::restart() {
@@ -187,7 +234,19 @@ BaseDecoder::StepResult WebpDecoder::decode_still(const DecodeOptions &opts) {
     m_config.output.u.RGBA.stride = (int)m_row_stride;
     m_config.output.u.RGBA.size = m_buffer.size();
 
-    m_idec = WebPINewDecoder(&m_config.output);
+    if (m_region.width > 0) {
+      m_config.options.use_cropping = 1;
+      m_config.options.crop_left = (int)m_region.x;
+      m_config.options.crop_top = (int)m_region.y;
+      m_config.options.crop_width = (int)m_region.width;
+      m_config.options.crop_height = (int)m_region.height;
+      if (m_scale > 1) {
+        m_config.options.use_scaling = 1;
+        m_config.options.scaled_width = (int)info.original_width;
+        m_config.options.scaled_height = (int)info.original_height;
+      }
+    }
+    m_idec = WebPIDecode(nullptr, 0, &m_config);
     if (!m_idec) {
       throw std::runtime_error("Failed to create WebP decoder");
     }

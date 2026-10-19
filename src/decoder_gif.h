@@ -29,6 +29,8 @@ public:
 
 protected:
   void restart() override;
+  void rewind_codec() override;
+  InvalidRect begin_region(const InvalidRect &want) override;
 
 private:
   void close();
