@@ -186,11 +186,12 @@ else()
     if(EMSCRIPTEN)
         # Every object alike, or the link refuses: shared memory for threads
         # (or none), WASM SIMD, and one exception/longjmp ABI (the decoders
-        # throw; libpng and libjpeg longjmp).
+        # throw; libpng and libjpeg longjmp). Standard exnref EH (try_table):
+        # the legacy 'try' instruction is deprecated.
         if(IMAGEDECODER_WASM_THREADS)
             string(APPEND _flags " -pthread")
         endif()
-        string(APPEND _flags " -msimd128 -fwasm-exceptions -sSUPPORT_LONGJMP=wasm")
+        string(APPEND _flags " -msimd128 -fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0 -sSUPPORT_LONGJMP=wasm")
         set(_c_extra "")
     endif()
     list(APPEND EP_CMAKE_ARGS
